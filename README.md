@@ -39,10 +39,6 @@ redis-server
 my_server.py
 ```
 
-## Why memguard exists
-
-It was built after a Mac running several AI agents crashed when memory ran out. Three jobs used about 24 GB between them on a 24 GB machine. Much of what such jobs use is GPU memory, which ordinary tools miss: one job was measured at **20.7 GB** while ordinary tools reported only **7.8 MB**. memguard measures what each job really uses, so it catches exactly this.
-
 ## Uninstall
 
 Open the disk image again and double-click **Uninstall memguard**.
