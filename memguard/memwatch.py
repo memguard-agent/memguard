@@ -94,9 +94,9 @@ WARN_GRACE_SAMPLES = int(os.environ.get("MEMWATCH_WARN_GRACE_SAMPLES", 10))
 #: Guidance quoted verbatim in the pre-stop warning. memwatch only observes a pid's
 #: aggregate footprint, never what it is doing, so the advice is necessarily generic.
 STREAMING_LOADER_GUIDANCE = (
-    "a bounded alternative: stream/chunk data instead of loading it whole, lower the "
-    "batch size or the number of parallel workers, release tensors (and "
-    "torch.mps.empty_cache()) between items, or wait for the box to drain."
+    "stream/chunk data instead of loading it whole, lower the batch size or the "
+    "number of parallel workers, release tensors (and torch.mps.empty_cache()) "
+    "between items, or wait for the box to drain."
 )
 
 #: Substrings of command lines that are NEVER suspended or killed (one per line, `#`
@@ -516,7 +516,7 @@ def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
     that writes into other people's terminals is not a dry run.
     """
     if dry_run:
-        print(f"[memwatch] DRY RUN: would have notified {tty or 'desktop'} — "
+        print(f"[memguard] DRY RUN: would have notified {tty or 'desktop'} — "
               f"{title}: {message}", flush=True)
         return
     try:
@@ -530,13 +530,13 @@ def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
     if tty:
         try:
             with open(f"/dev/{tty}", "w") as handle:
-                handle.write(f"\n\033[1;31m[memwatch] {title}: {message}\033[0m\n")
+                handle.write(f"\n\033[1;31m[memguard] {title}: {message}\033[0m\n")
         except OSError:
             pass
     session = _inbox.session_of(pid) if pid is not None else None
     if session is not None:
         _inbox.post(session, f"{title}: {message}")
-    print(f"[memwatch] {title}: {message}"
+    print(f"[memguard] {title}: {message}"
           + (f"  -> agent session {session}" if session else ""), flush=True)
 
 
@@ -652,7 +652,7 @@ def run_daemon(dry_run: bool = False) -> int:
     """
     others = _other_daemon_pids()
     if others and not dry_run:
-        print(f"[memwatch] REFUSING to start — another watchdog is already running "
+        print(f"[memguard] REFUSING to start — another watchdog is already running "
               f"(pid {', '.join(str(p) for p in others)}).\n"
               f"  Two watchdogs both pick victims and both escalate to SIGKILL.\n"
               f"  Stop the other first:  kill {others[0]}\n"
@@ -663,11 +663,11 @@ def run_daemon(dry_run: bool = False) -> int:
 
     state = WatchState()
     mode = "DRY RUN — no signals will be sent" if dry_run else "ARMED"
-    print(f"[memwatch] watchdog up [{mode}] (pid {os.getpid()}) — "
+    print(f"[memguard] watchdog up [{mode}] (pid {os.getpid()}) — "
           f"warn<{WARN_FREE_GB} stop<{STOP_FREE_GB} kill<{KILL_FREE_GB} GB free, "
           f"{WARN_GRACE_SAMPLES}-sample grace before stop, "
           f"sampling {SAMPLE_SECONDS}s.  Stop with Ctrl-C or SIGTERM.", flush=True)
-    print(f"[memwatch] exempt (never suspended/killed), from {EXEMPT_FILE}: "
+    print(f"[memguard] exempt (never suspended/killed), from {EXEMPT_FILE}: "
           f"{', '.join(EXEMPT_PATTERNS) if EXEMPT_PATTERNS else 'NONE'}", flush=True)
 
     # launchd's `unload` sends SIGTERM; without this it would kill the watchdog
@@ -733,9 +733,9 @@ def run_daemon(dry_run: bool = False) -> int:
                                 "Memory low — your job may be suspended soon",
                                 f"{victim.short_command} pid {victim.pid} using "
                                 f"{victim.best_gb:.1f} GB; box has {free_gb:.1f} GB "
-                                f"free. If loading a large file, switch to "
-                                f"{STREAMING_LOADER_GUIDANCE} now — this job will be "
-                                f"SUSPENDED in ~{grace_s:.0f}s if memory is still low.",
+                                f"free. Reduce its memory now, or it will be "
+                                f"SUSPENDED in ~{grace_s:.0f}s if memory is still low. "
+                                f"Options: {STREAMING_LOADER_GUIDANCE}",
                                 tty=tty,
                                 dry_run=dry_run,
                                 pid=victim.pid,
@@ -825,7 +825,7 @@ def run_daemon(dry_run: bool = False) -> int:
             except KeyboardInterrupt:
                 return 0
             except Exception as exc:                      # a watchdog must not die
-                print(f"[memwatch] sample failed: {exc!r}", file=sys.stderr, flush=True)
+                print(f"[memguard] sample failed: {exc!r}", file=sys.stderr, flush=True)
                 time.sleep(SAMPLE_SECONDS)
     finally:
         # THE point of this block: a suspended process holds all its memory and has no
@@ -834,26 +834,26 @@ def run_daemon(dry_run: bool = False) -> int:
         # frozen forever with nobody left to resume it. Shutting the watchdog down must
         # never leave the box worse than not running it at all.
         if state.stopped_pid is not None:
-            print(f"[memwatch] shutting down — resuming suspended pid "
+            print(f"[memguard] shutting down — resuming suspended pid "
                   f"{state.stopped_pid} first", flush=True)
             _signal_pid(state.stopped_pid, signal.SIGCONT, "resumed on shutdown", dry_run)
             state.stopped_pid = None
-        print("[memwatch] watchdog stopped", flush=True)
+        print("[memguard] watchdog stopped", flush=True)
 
 
 def _signal_pid(pid: Optional[int], sig: int, verb: str, dry_run: bool = False) -> None:
     if pid is None:
         return
     if dry_run:
-        print(f"[memwatch] DRY RUN: would have {verb} pid {pid}", flush=True)
+        print(f"[memguard] DRY RUN: would have {verb} pid {pid}", flush=True)
         return
     try:
         os.kill(pid, sig)
-        print(f"[memwatch] {verb} pid {pid}", flush=True)
+        print(f"[memguard] {verb} pid {pid}", flush=True)
     except ProcessLookupError:
-        print(f"[memwatch] pid {pid} already gone", flush=True)
+        print(f"[memguard] pid {pid} already gone", flush=True)
     except PermissionError:
-        print(f"[memwatch] not permitted to signal pid {pid}", file=sys.stderr)
+        print(f"[memguard] not permitted to signal pid {pid}", file=sys.stderr)
 
 
 #: Operator actions on one window's compute children. Kill is last and separate

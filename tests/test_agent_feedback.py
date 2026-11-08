@@ -85,6 +85,25 @@ class TestNotifyReachesTheAgent:
         text = _inbox.take(SESSION)
         assert "may be suspended soon" in text and str(agent_job.pid) in text
 
+    def test_terminal_line_and_log_are_signed_memguard(self, monkeypatch, capsys,
+                                                       tmp_path):
+        """The product is memguard; `memwatch` is an internal module name and must not
+        appear in what a person or agent reads."""
+        monkeypatch.setattr(memwatch.subprocess, "run", lambda *a, **k: None)
+        written = []
+        real_open = open
+        def fake_open(path, mode="r", *a, **k):
+            if str(path).startswith("/dev/"):
+                written.append(tmp_path / "tty")
+                return real_open(written[-1], mode, *a, **k)
+            return real_open(path, mode, *a, **k)
+        monkeypatch.setattr("builtins.open", fake_open)
+        memwatch.notify("SUSPENDED your job (memory)", "x", tty="ttys999")
+        terminal = written[0].read_text()
+        log = capsys.readouterr().out
+        assert "[memguard]" in terminal and "[memguard]" in log
+        assert "memwatch" not in terminal + log
+
     def test_dry_run_tells_no_agent_anything(self, agent_job):
         memwatch.notify("SUSPENDED your job (memory)", "x", pid=agent_job.pid,
                         dry_run=True)
