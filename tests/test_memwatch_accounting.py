@@ -6,6 +6,7 @@ this suite.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -39,14 +40,16 @@ class TestExemptions:
         assert not proc(1, command=command).is_targetable
 
     def test_exempt_file_parsing(self, tmp_path):
-        from memguard.memwatch import load_exempt_patterns
+        from memguard.memwatch import load_exempt
         f = tmp_path / "exempt"
-        f.write_text("# comment\nservice_a\n\n  service b  # trailing comment\n")
-        assert load_exempt_patterns(str(f)) == ("service_a", "service b")
+        f.write_text("# comment\nservice_a\n\n  service b  # trailing comment\n"
+                     f"dir: {tmp_path}/proj  # a folder\n")
+        assert load_exempt(str(f)) == (("service_a", "service b"),
+                                       (os.path.realpath(f"{tmp_path}/proj"),))
 
     def test_missing_exempt_file_means_no_exemptions(self, tmp_path):
-        from memguard.memwatch import load_exempt_patterns
-        assert load_exempt_patterns(str(tmp_path / "absent")) == ()
+        from memguard.memwatch import load_exempt
+        assert load_exempt(str(tmp_path / "absent")) == ((), ())
 
     def test_the_claude_cli_is_never_the_victim(self):
         """Killing the agent leaves its runaway job running — strictly worse."""
@@ -1139,3 +1142,63 @@ class TestSingleDaemonCheck:
     def test_a_genuinely_separate_daemon_is_still_detected(self, monkeypatch):
         memwatch = self._patch(monkeypatch, mine=101)
         assert sorted(memwatch._other_daemon_pids()) == [200, 201]
+
+
+class TestFolderExemptions:
+    """`dir:` lines: real processes, because the folder is read from the live process."""
+
+    @pytest.fixture
+    def folders(self, tmp_path, monkeypatch):
+        from memguard import memwatch
+        ignored, elsewhere = tmp_path / "ignored", tmp_path / "elsewhere"
+        (ignored / "sub").mkdir(parents=True)
+        elsewhere.mkdir()
+        monkeypatch.setattr(memwatch, "EXEMPT_DIRS", (os.path.realpath(ignored),))
+        children = []
+
+        def start(cwd, env_extra=None):
+            # A Python child, not /bin/sleep: macOS hides the environment of its own
+            # system binaries, while an agent's jobs (python, node, ...) are readable.
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                     cwd=cwd,
+                                     env={**os.environ, **(env_extra or {})})
+            children.append(child)
+            time.sleep(0.3)          # let exec finish so the environment is readable
+            return child
+        yield ignored, elsewhere, start
+        for child in children:
+            child.kill()
+            child.wait()
+
+    def _job(self, pid):
+        return ProcInfo(pid=pid, ppid=1, tty="", rss_gb=5.0, command="python job.py")
+
+    def test_a_job_running_inside_the_folder_is_never_targeted(self, folders):
+        ignored, _, start = folders
+        job = self._job(start(ignored / "sub", {"CLAUDE_PID": ""}).pid)
+        assert job.is_exempt and not job.is_targetable
+
+    def test_a_job_whose_agent_works_in_the_folder_is_never_targeted(self, folders):
+        """The job changed directory, but its agent was started in the folder."""
+        ignored, elsewhere, start = folders
+        agent = start(ignored)
+        job = self._job(start(elsewhere, {"CLAUDE_PID": str(agent.pid)}).pid)
+        assert job.is_exempt and not job.is_targetable
+
+    def test_an_unrelated_job_stays_targetable(self, folders):
+        _, elsewhere, start = folders
+        job = self._job(start(elsewhere, {"CLAUDE_PID": ""}).pid)
+        assert not job.is_exempt and job.is_targetable
+
+    def test_an_agent_younger_than_the_job_is_a_recycled_pid(self, folders):
+        ignored, elsewhere, start = folders
+        job_proc = start(elsewhere, {"CLAUDE_PID": "PLACEHOLDER"})
+        agent = start(ignored)
+        from memguard import _inbox
+        real = _inbox.env_var_of
+        try:
+            _inbox.env_var_of = lambda pid, name: (str(agent.pid) if pid == job_proc.pid
+                                                   else real(pid, name))
+            assert not self._job(job_proc.pid).is_exempt
+        finally:
+            _inbox.env_var_of = real

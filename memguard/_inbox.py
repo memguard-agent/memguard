@@ -25,6 +25,8 @@ from pathlib import Path
 from typing import Optional
 
 SESSION_ENV_VAR = "CLAUDE_CODE_SESSION_ID"
+#: The pid of the agent that started a job, likewise inherited by every descendant.
+AGENT_PID_ENV_VAR = "CLAUDE_PID"
 
 INBOX_DIR = Path(os.environ.get(
     "MEMGUARD_INBOX_DIR", os.path.expanduser("~/.cache/memguard/inbox")

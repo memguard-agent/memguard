@@ -99,8 +99,9 @@ STREAMING_LOADER_GUIDANCE = (
     "between items, or wait for the box to drain."
 )
 
-#: Substrings of command lines that are NEVER suspended or killed (one per line, `#`
-#: comments allowed). Machine-local, deliberately not part of this repository: it names
+#: What is NEVER suspended or killed, one entry per line (`#` comments allowed): a
+#: substring of a command line, or `dir: <folder>` for every job that runs inside that
+#: folder or was started by an agent running inside it. Machine-local, deliberately not part of this repository: it names
 #: whatever services on THIS box must not stall. A missing file means "no exemptions"
 #: (announced at daemon start); an unreadable one raises, because silently dropping
 #: exemptions would make protected services targetable.
@@ -109,15 +110,46 @@ EXEMPT_FILE = os.environ.get(
 )
 
 
-def load_exempt_patterns(path: str = EXEMPT_FILE) -> tuple[str, ...]:
+def load_exempt(path: str = EXEMPT_FILE) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(command-line substrings, folders) from the exemption file."""
     if not os.path.exists(path):
-        return ()
+        return (), ()
     with open(path, encoding="utf-8") as handle:
-        lines = (line.split("#", 1)[0].strip() for line in handle)
-        return tuple(line for line in lines if line)
+        lines = [line.split("#", 1)[0].strip() for line in handle]
+    entries = [line for line in lines if line]
+    dirs = tuple(os.path.realpath(os.path.expanduser(e[4:].strip()))
+                 for e in entries if e.startswith("dir:"))
+    return tuple(e for e in entries if not e.startswith("dir:")), dirs
 
 
-EXEMPT_PATTERNS = load_exempt_patterns()
+EXEMPT_PATTERNS, EXEMPT_DIRS = load_exempt()
+
+
+def _is_within(path: str, folder: str) -> bool:
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
+def work_dirs(pid: int) -> tuple[str, ...]:
+    """The folder `pid` runs in and, if an AI agent started it, the agent's folder.
+
+    Claude Code exports `CLAUDE_PID` to every job it starts. The agent keeps the folder
+    it was started in even when its job changes directory, so this attributes a job to
+    its agent's project. The agent counts only if it is still alive and older than the
+    job, so a recycled pid is never mistaken for it.
+    """
+    import psutil
+    dirs = []
+    try:
+        job = psutil.Process(pid)
+        dirs.append(job.cwd())
+        agent_pid = _inbox.env_var_of(pid, _inbox.AGENT_PID_ENV_VAR)
+        if agent_pid and agent_pid.isdigit():
+            agent = psutil.Process(int(agent_pid))
+            if agent.create_time() <= job.create_time():
+                dirs.append(agent.cwd())
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        pass
+    return tuple(dirs)
 
 #: The `claude` CLI itself is never the target: killing an agent instead of its runaway
 #: job destroys the session's context while LEAVING the memory consumer running, which
@@ -137,6 +169,7 @@ class ProcInfo:
     command: str
     state: str = ""     # ps state: "T" = suspended, "R"/"S" = running/sleeping
     footprint_gb: Optional[float] = None
+    _in_exempt_dir: Optional[bool] = field(default=None, repr=False, compare=False)
 
     @property
     def is_suspended(self) -> bool:
@@ -154,7 +187,14 @@ class ProcInfo:
 
     @property
     def is_exempt(self) -> bool:
-        return any(p in self.command for p in EXEMPT_PATTERNS)
+        if any(p in self.command for p in EXEMPT_PATTERNS):
+            return True
+        if not EXEMPT_DIRS:
+            return False
+        if self._in_exempt_dir is None:     # looked up once per scan, not per call
+            self._in_exempt_dir = any(_is_within(d, folder) for d in work_dirs(self.pid)
+                                      for folder in EXEMPT_DIRS)
+        return self._in_exempt_dir
 
     @property
     def is_targetable(self) -> bool:
@@ -643,6 +683,19 @@ def _other_daemon_pids() -> list[int]:
     return [pid for pid in daemons if pid not in lineage]
 
 
+def _exempt_file_mtime() -> Optional[float]:
+    try:
+        return os.stat(EXEMPT_FILE).st_mtime
+    except FileNotFoundError:
+        return None
+
+
+def _announce_exempt() -> None:
+    print(f"[memguard] exempt (never suspended/killed), from {EXEMPT_FILE}: "
+          f"{', '.join(EXEMPT_PATTERNS) if EXEMPT_PATTERNS else 'NONE'}"
+          f"; folders: {', '.join(EXEMPT_DIRS) if EXEMPT_DIRS else 'NONE'}", flush=True)
+
+
 def run_daemon(dry_run: bool = False) -> int:
     """Watch memory and act. With dry_run, decide and LOG but send no signal.
 
@@ -667,8 +720,8 @@ def run_daemon(dry_run: bool = False) -> int:
           f"warn<{WARN_FREE_GB} stop<{STOP_FREE_GB} kill<{KILL_FREE_GB} GB free, "
           f"{WARN_GRACE_SAMPLES}-sample grace before stop, "
           f"sampling {SAMPLE_SECONDS}s.  Stop with Ctrl-C or SIGTERM.", flush=True)
-    print(f"[memguard] exempt (never suspended/killed), from {EXEMPT_FILE}: "
-          f"{', '.join(EXEMPT_PATTERNS) if EXEMPT_PATTERNS else 'NONE'}", flush=True)
+    exempt_mtime = _exempt_file_mtime()
+    _announce_exempt()
 
     # launchd's `unload` sends SIGTERM; without this it would kill the watchdog
     # outright and any process it had suspended would stay frozen forever.
@@ -692,6 +745,11 @@ def run_daemon(dry_run: bool = False) -> int:
     try:
         while True:
             try:
+                if _exempt_file_mtime() != exempt_mtime:   # edited: applies at once
+                    global EXEMPT_PATTERNS, EXEMPT_DIRS
+                    EXEMPT_PATTERNS, EXEMPT_DIRS = load_exempt()
+                    exempt_mtime = _exempt_file_mtime()    # after a SUCCESSFUL load
+                    _announce_exempt()
                 free_gb, _total, _swap = system_memory()
                 action = decide_action(free_gb, state)
 

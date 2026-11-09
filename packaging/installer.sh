@@ -33,8 +33,10 @@ rsync -a --delete --exclude logs --exclude .venv "$PAYLOAD/" "$DEST/" || fail "c
 mkdir -p "$HOME/.config/memguard"
 [ -f "$HOME/.config/memguard/exempt" ] || printf '%s\n' \
     "# memguard: processes that must never be paused or killed." \
-    "# One substring of the command line per line, e.g.:" \
-    "# redis-server" > "$HOME/.config/memguard/exempt"
+    "# One per line: part of a program's command line, e.g." \
+    "# redis-server" \
+    "# or a folder: everything running in it, or started by an agent working in it, e.g." \
+    "# dir: ~/code/important_project" > "$HOME/.config/memguard/exempt"
 
 "$DEST/tools/install_memwatch.sh" || fail "the watchdog did not start"
 

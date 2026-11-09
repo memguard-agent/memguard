@@ -39,6 +39,12 @@ redis-server
 my_server.py
 ```
 
+To leave a whole folder alone, add it with `dir:` in front. memguard then never pauses anything running in that folder, or anything started by an agent working in it:
+
+```
+dir: ~/code/important_project
+```
+
 ## Uninstall
 
 Open the disk image again and double-click **Uninstall memguard**.
