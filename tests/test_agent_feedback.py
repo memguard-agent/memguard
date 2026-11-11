@@ -104,6 +104,18 @@ class TestNotifyReachesTheAgent:
         assert "[memguard]" in terminal and "[memguard]" in log
         assert "memwatch" not in terminal + log
 
+    def test_an_agents_job_gets_no_raw_terminal_line(self, agent_job, monkeypatch):
+        """Claude Code draws that terminal; raw text lands on top of its screen."""
+        monkeypatch.setattr(memwatch.subprocess, "run", lambda *a, **k: None)
+        real_open = open
+        def no_tty(path, *a, **k):
+            assert not str(path).startswith("/dev/"), "wrote into the agent's terminal"
+            return real_open(path, *a, **k)
+        monkeypatch.setattr("builtins.open", no_tty)
+        memwatch.notify("Memory low — your job may be suspended soon", "x",
+                        tty="ttys999", pid=agent_job.pid)
+        assert "x" in _inbox.take(SESSION)
+
     def test_dry_run_tells_no_agent_anything(self, agent_job):
         memwatch.notify("SUSPENDED your job (memory)", "x", pid=agent_job.pid,
                         dry_run=True)
@@ -126,6 +138,9 @@ class TestHook:
         assert payload["hookEventName"] == "PostToolUse"
         assert "boltz pid 25963" in payload["additionalContext"]
         assert "resumes on its own" in payload["additionalContext"]
+        shown = json.loads(out)["systemMessage"]
+        assert "boltz pid 25963" in shown and "resumes on its own" not in shown, (
+            "the person sees memguard's message, not the instructions meant for the agent")
 
     def test_hook_is_silent_when_there_is_nothing_to_say(self, monkeypatch):
         assert self._run_hook(monkeypatch, {"session_id": SESSION,

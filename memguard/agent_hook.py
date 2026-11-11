@@ -3,8 +3,9 @@
 Registered for PostToolUse and UserPromptSubmit by `tools/install_agent_hook.sh`.
 Reads the hook input from stdin, takes the session's inbox (see `memguard._inbox`),
 and, if there is anything, prints it as `additionalContext` so the agent reads it on
-its next step. Prints nothing when the inbox is empty: the common case costs one
-failed `rename`.
+its next step, and as `systemMessage` so the person watching that session sees it in
+Claude Code's own transcript. Prints nothing when the inbox is empty: the common case
+costs one failed `rename`.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ def main() -> int:
     if not messages:
         return 0
     json.dump({
+        "systemMessage": messages.rstrip("\n"),
         "hookSpecificOutput": {
             "hookEventName": event["hook_event_name"],
             "additionalContext": PREAMBLE + messages,

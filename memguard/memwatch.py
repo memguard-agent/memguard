@@ -545,11 +545,13 @@ def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
     agent, the AGENT itself.
 
     - Desktop notification and the daemon log, for the human.
-    - A line in the job's own terminal, when it has one. This is visible on screen
-      only; an agent never reads its terminal's display.
     - The agent's inbox (`memguard._inbox`), when `pid` carries an agent session id.
       `memguard.agent_hook` delivers it into the agent's context on its next step, so
-      the agent can shrink its job before memwatch suspends it.
+      the agent can shrink its job before memwatch suspends it, and shows it to the
+      person in Claude Code's transcript.
+    - Otherwise a line in the job's own terminal, when it has one. Never for an agent's
+      job: that terminal is drawn by Claude Code, and raw text written into it lands
+      on top of Claude Code's screen.
 
     Under dry_run this stays on THIS process's stdout and touches nothing else: telling
     another agent its job was suspended when it was not would be a lie, and a dry run
@@ -567,13 +569,13 @@ def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
         )
     except (OSError, subprocess.SubprocessError):
         pass
-    if tty:
+    session = _inbox.session_of(pid) if pid is not None else None
+    if tty and session is None:
         try:
             with open(f"/dev/{tty}", "w") as handle:
                 handle.write(f"\n\033[1;31m[memguard] {title}: {message}\033[0m\n")
         except OSError:
             pass
-    session = _inbox.session_of(pid) if pid is not None else None
     if session is not None:
         _inbox.post(session, f"{title}: {message}")
     print(f"[memguard] {title}: {message}"
