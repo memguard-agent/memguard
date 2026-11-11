@@ -1,6 +1,6 @@
 [project]
 name = "memguard"
-version = "0.1.1"
+version = "0.2.0"
 description = "Memory safety for machines shared by many coding agents: OOM watchdog + large-load guard"
 license = "Apache-2.0"
 requires-python = ">=3.11"
