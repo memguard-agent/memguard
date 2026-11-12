@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import types
 import os
 import subprocess
 import sys
@@ -76,10 +77,15 @@ class TestInbox:
         assert _inbox.take(SESSION) == ""
 
 
+def _no_osascript(*_a, **_k):
+    """Stands in for the desktop notification: tests must not pop up real ones."""
+    return types.SimpleNamespace(poll=lambda: 0)
+
+
 class TestNotifyReachesTheAgent:
     def test_warning_about_an_agent_job_lands_in_that_agents_inbox(self, agent_job,
                                                                   monkeypatch):
-        monkeypatch.setattr(memwatch.subprocess, "run", lambda *a, **k: None)  # osascript
+        monkeypatch.setattr(memwatch.subprocess, "Popen", _no_osascript)
         memwatch.notify("Memory low — your job may be suspended soon",
                         f"python pid {agent_job.pid} using 20.7 GB", pid=agent_job.pid)
         text = _inbox.take(SESSION)
@@ -89,7 +95,7 @@ class TestNotifyReachesTheAgent:
                                                        tmp_path):
         """The product is memguard; `memwatch` is an internal module name and must not
         appear in what a person or agent reads."""
-        monkeypatch.setattr(memwatch.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(memwatch.subprocess, "Popen", _no_osascript)
         written = []
         real_open = open
         def fake_open(path, mode="r", *a, **k):
@@ -106,7 +112,7 @@ class TestNotifyReachesTheAgent:
 
     def test_an_agents_job_gets_no_raw_terminal_line(self, agent_job, monkeypatch):
         """Claude Code draws that terminal; raw text lands on top of its screen."""
-        monkeypatch.setattr(memwatch.subprocess, "run", lambda *a, **k: None)
+        monkeypatch.setattr(memwatch.subprocess, "Popen", _no_osascript)
         real_open = open
         def no_tty(path, *a, **k):
             assert not str(path).startswith("/dev/"), "wrote into the agent's terminal"

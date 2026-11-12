@@ -35,7 +35,11 @@ s — the warning's own sample counts toward the countdown) to react before the 
 lands. The agent driving that job can often bound it in the time a SIGSTOP would
 otherwise just freeze it for.
 
-This grace period is a courtesy, not a delay applied everywhere: once free memory is
+This grace period is a courtesy, not a delay applied everywhere. It is granted only if
+the machine can survive it: when free memory is FALLING so fast that it would pass
+KILL_FREE_GB within FALL_HORIZON_SAMPLES samples, the largest job is suspended at once
+(2026-11-12: a job grew from 8.0 to 13.9 GB within the 27 s grace it was given at
+2.8 GB free, and the Mac froze 20 s after the warning). And once free memory is
 past KILL_FREE_GB — a genuine OOM cliff, not shallow pressure — the daemon suspends the
 largest process IMMEDIATELY (action 'stop_severe', distinct from the grace-elapsed
 'stop') with no warning and no wait. 'stop' (grace elapsed) always targets the SPECIFIC
@@ -90,6 +94,19 @@ SAMPLE_SECONDS = float(os.environ.get("MEMWATCH_SAMPLE_SECONDS", 3.0))
 #: RESUME_SAMPLES (a duration in samples, not wall time, so it stays correct if
 #: SAMPLE_SECONDS is overridden).
 WARN_GRACE_SAMPLES = int(os.environ.get("MEMWATCH_WARN_GRACE_SAMPLES", 10))
+
+#: The fall rate of free memory is measured over this many recent samples (smoothing the
+#: +-2 GB single-sample bounces that are normal on a busy box) and projected this many
+#: samples ahead: the time the daemon needs to see the next sample and act on it.
+FALL_WINDOW_SAMPLES = int(os.environ.get("MEMWATCH_FALL_WINDOW_SAMPLES", 5))
+FALL_HORIZON_SAMPLES = int(os.environ.get("MEMWATCH_FALL_HORIZON_SAMPLES", 2))
+
+#: macOS swaps to the startup disk. With too little free disk, swap cannot grow, memory
+#: that looks reclaimable is not, and the machine can freeze before free memory reads
+#: low (both 2026 panics reported "LOW swap space"; the disk had ~9 GB free). Below this
+#: the person is told, once an hour.
+DISK_WARN_GB = float(os.environ.get("MEMWATCH_DISK_WARN_GB", 20.0))
+SWAP_DIR = "/private/var/vm"
 
 #: Guidance quoted verbatim in the pre-stop warning. memwatch only observes a pid's
 #: aggregate footprint, never what it is doing, so the advice is necessarily generic.
@@ -280,6 +297,7 @@ class _RusageInfoV0(ctypes.Structure):
 
 
 _LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib")
+_LIBC = ctypes.CDLL(None, use_errno=True)
 
 
 def phys_footprint_gb(pid: int) -> Optional[float]:
@@ -490,6 +508,15 @@ class WatchState:
     #: not a single tick back above STOP_FREE_GB (a zero-hysteresis reset livelocks:
     #: memory oscillating around STOP_FREE_GB re-warns forever and never stops).
     warn_recovered_samples: int = 0
+    #: The last FALL_WINDOW_SAMPLES free-memory readings, oldest first.
+    recent_free: list[float] = field(default_factory=list)
+
+
+def fall_rate_gb_s(free_gb: float, state: WatchState) -> float:
+    """How fast free memory is falling (GB/s, positive = falling), over the window."""
+    if not state.recent_free:
+        return 0.0
+    return (state.recent_free[0] - free_gb) / (len(state.recent_free) * SAMPLE_SECONDS)
 
 
 def decide_action(free_gb: float, state: WatchState) -> Optional[str]:
@@ -503,8 +530,9 @@ def decide_action(free_gb: float, state: WatchState) -> Optional[str]:
 
     'stop_severe' is a DISTINCT action: the caller must pick a FRESH victim for it
     (pick_victim(procs)), never a stale state.warned_pid. Once free memory is past
-    KILL_FREE_GB, waiting out a grace period would leave the box unprotected during a
-    genuine OOM cliff, so it bypasses warn_victim entirely.
+    KILL_FREE_GB, or below STOP_FREE_GB and falling fast enough to pass KILL_FREE_GB
+    within FALL_HORIZON_SAMPLES, waiting out a grace period would leave the box
+    unprotected during a genuine OOM cliff, so it bypasses warn_victim entirely.
 
     DELIBERATELY free memory ONLY — swap used does not gate any decision. It is not a
     pressure signal on macOS: tens of GB of swap sit in use from ordinary background
@@ -520,6 +548,9 @@ def decide_action(free_gb: float, state: WatchState) -> Optional[str]:
     if free_gb < KILL_FREE_GB:
         return "stop_severe"
     if free_gb < STOP_FREE_GB:
+        horizon_s = FALL_HORIZON_SAMPLES * SAMPLE_SECONDS
+        if free_gb - fall_rate_gb_s(free_gb, state) * horizon_s < KILL_FREE_GB:
+            return "stop_severe"            # no time for a grace period
         if state.warned_pid is None:
             return "warn_victim"
         if state.warned_samples + 1 >= WARN_GRACE_SAMPLES:
@@ -539,6 +570,9 @@ def pick_victim(procs: list[ProcInfo]) -> Optional[ProcInfo]:
 # ---------------------------------------------------------------------------
 # Notification
 # ---------------------------------------------------------------------------
+_NOTIFIERS: list[subprocess.Popen] = []
+
+
 def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
            pid: Optional[int] = None) -> None:
     """Tell everyone who must know: the human and, when `pid` was started by an AI
@@ -558,16 +592,20 @@ def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
     that writes into other people's terminals is not a dry run.
     """
     if dry_run:
-        print(f"[memguard] DRY RUN: would have notified {tty or 'desktop'} — "
+        print(f"{_stamp()} [memguard] DRY RUN: would have notified {tty or 'desktop'} — "
               f"{title}: {message}", flush=True)
         return
+    # Started, never waited for: under memory pressure launching osascript can take
+    # seconds, and the watchdog must keep sampling meanwhile. Finished ones are reaped
+    # on the next call.
+    _NOTIFIERS[:] = [n for n in _NOTIFIERS if n.poll() is None]
     try:
-        subprocess.run(
+        _NOTIFIERS.append(subprocess.Popen(
             ["osascript", "-e",
              f'display notification {message!r} with title {title!r}'],
-            capture_output=True, timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ))
+    except OSError:
         pass
     session = _inbox.session_of(pid) if pid is not None else None
     if tty and session is None:
@@ -578,7 +616,7 @@ def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
             pass
     if session is not None:
         _inbox.post(session, f"{title}: {message}")
-    print(f"[memguard] {title}: {message}"
+    print(f"{_stamp()} [memguard] {title}: {message}"
           + (f"  -> agent session {session}" if session else ""), flush=True)
 
 
@@ -685,6 +723,26 @@ def _other_daemon_pids() -> list[int]:
     return [pid for pid in daemons if pid not in lineage]
 
 
+def _stamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def disk_free_gb() -> float:
+    """Free space on the volume macOS swaps to."""
+    st = os.statvfs(SWAP_DIR)
+    return st.f_bavail * st.f_frsize / GB
+
+
+def kernel_pressure_level() -> int:
+    """macOS's own verdict: 1 normal, 2 warning, 4 critical."""
+    value = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(value))
+    if _LIBC.sysctlbyname(b"kern.memorystatus_vm_pressure_level", ctypes.byref(value),
+                          ctypes.byref(size), None, 0) != 0:
+        raise OSError(ctypes.get_errno(), "sysctl kern.memorystatus_vm_pressure_level")
+    return value.value
+
+
 def _exempt_file_mtime() -> Optional[float]:
     try:
         return os.stat(EXEMPT_FILE).st_mtime
@@ -693,7 +751,7 @@ def _exempt_file_mtime() -> Optional[float]:
 
 
 def _announce_exempt() -> None:
-    print(f"[memguard] exempt (never suspended/killed), from {EXEMPT_FILE}: "
+    print(f"{_stamp()} [memguard] exempt (never suspended/killed), from {EXEMPT_FILE}: "
           f"{', '.join(EXEMPT_PATTERNS) if EXEMPT_PATTERNS else 'NONE'}"
           f"; folders: {', '.join(EXEMPT_DIRS) if EXEMPT_DIRS else 'NONE'}", flush=True)
 
@@ -707,7 +765,7 @@ def run_daemon(dry_run: bool = False) -> int:
     """
     others = _other_daemon_pids()
     if others and not dry_run:
-        print(f"[memguard] REFUSING to start — another watchdog is already running "
+        print(f"{_stamp()} [memguard] REFUSING to start — another watchdog is already running "
               f"(pid {', '.join(str(p) for p in others)}).\n"
               f"  Two watchdogs both pick victims and both escalate to SIGKILL.\n"
               f"  Stop the other first:  kill {others[0]}\n"
@@ -718,7 +776,7 @@ def run_daemon(dry_run: bool = False) -> int:
 
     state = WatchState()
     mode = "DRY RUN — no signals will be sent" if dry_run else "ARMED"
-    print(f"[memguard] watchdog up [{mode}] (pid {os.getpid()}) — "
+    print(f"{_stamp()} [memguard] watchdog up [{mode}] (pid {os.getpid()}) — "
           f"warn<{WARN_FREE_GB} stop<{STOP_FREE_GB} kill<{KILL_FREE_GB} GB free, "
           f"{WARN_GRACE_SAMPLES}-sample grace before stop, "
           f"sampling {SAMPLE_SECONDS}s.  Stop with Ctrl-C or SIGTERM.", flush=True)
@@ -732,6 +790,7 @@ def run_daemon(dry_run: bool = False) -> int:
     signal.signal(signal.SIGTERM, _request_shutdown)
 
     last_warn = 0.0
+    last_disk_warn = -3600.0
     #: Separate 120s cooldown for the per-victim notification, mirroring the general
     #: "warn" rate limit — a warning that keeps clearing (sustained recovery) and
     #: re-arming under bouncy memory would otherwise re-notify (osascript + tty write)
@@ -752,8 +811,22 @@ def run_daemon(dry_run: bool = False) -> int:
                     EXEMPT_PATTERNS, EXEMPT_DIRS = load_exempt()
                     exempt_mtime = _exempt_file_mtime()    # after a SUCCESSFUL load
                     _announce_exempt()
-                free_gb, _total, _swap = system_memory()
+                free_gb, _total, swap_gb = system_memory()
                 action = decide_action(free_gb, state)
+                if free_gb < WARN_FREE_GB:          # the record a post-mortem needs
+                    print(f"{_stamp()} [memguard] sample: free {free_gb:.1f} GB, falling "
+                          f"{fall_rate_gb_s(free_gb, state):+.2f} GB/s, kernel pressure "
+                          f"{kernel_pressure_level()}, swap used {swap_gb:.1f} GB, disk "
+                          f"free {disk_free_gb():.1f} GB -> {action or 'none'}", flush=True)
+                if time.monotonic() - last_disk_warn > 3600:
+                    disk_gb = disk_free_gb()
+                    if disk_gb < DISK_WARN_GB:
+                        last_disk_warn = time.monotonic()
+                        notify("Disk almost full: memory protection weakened",
+                               f"only {disk_gb:.1f} GB free on the startup disk. macOS "
+                               f"needs free disk space when memory runs low; without it "
+                               f"the Mac can freeze. Free up disk space.",
+                               dry_run=dry_run)
 
                 if action == "resume":
                     notify("RESUMED your job",
@@ -764,12 +837,13 @@ def run_daemon(dry_run: bool = False) -> int:
                     state.stopped_pid, state.recovered_samples = None, 0
 
                 elif action == "kill":
-                    notify("KILLING suspended job",
+                    # Act first, then tell: telling costs time the machine may not have.
+                    _signal_pid(state.stopped_pid, signal.SIGKILL, "killed", dry_run)
+                    notify("KILLED suspended job",
                            f"pid {state.stopped_pid}: free memory {free_gb:.1f} GB is under "
                            f"the {KILL_FREE_GB:.1f} GB kill threshold even with it "
                            f"suspended. Rerun it with less memory.",
                            dry_run=dry_run, pid=state.stopped_pid)
-                    _signal_pid(state.stopped_pid, signal.SIGKILL, "killed", dry_run)
                     state.stopped_pid, state.recovered_samples = None, 0
 
                 elif action == "warn_victim":
@@ -828,6 +902,9 @@ def run_daemon(dry_run: bool = False) -> int:
                         # actual largest consumer keeps growing.
                         victim = pick_victim(procs)
                     if victim is not None:
+                        # Act first, then tell: telling costs time the machine may
+                        # not have.
+                        _signal_pid(victim.pid, signal.SIGSTOP, "suspended", dry_run)
                         tty = resolve_ttys(procs).get(victim.pid, "")
                         notify(
                             "SUSPENDED your job (memory)",
@@ -838,7 +915,6 @@ def run_daemon(dry_run: bool = False) -> int:
                             dry_run=dry_run,
                             pid=victim.pid,
                         )
-                        _signal_pid(victim.pid, signal.SIGSTOP, "suspended", dry_run)
                         state.stopped_pid = victim.pid
                         state.recovered_samples = 0
                     # The warning episode (if any) is over either way — a fresh
@@ -881,11 +957,12 @@ def run_daemon(dry_run: bool = False) -> int:
                         if free_gb < STOP_FREE_GB:
                             state.warned_samples += 1
 
+                state.recent_free = (state.recent_free + [free_gb])[-FALL_WINDOW_SAMPLES:]
                 time.sleep(SAMPLE_SECONDS)
             except KeyboardInterrupt:
                 return 0
             except Exception as exc:                      # a watchdog must not die
-                print(f"[memguard] sample failed: {exc!r}", file=sys.stderr, flush=True)
+                print(f"{_stamp()} [memguard] sample failed: {exc!r}", file=sys.stderr, flush=True)
                 time.sleep(SAMPLE_SECONDS)
     finally:
         # THE point of this block: a suspended process holds all its memory and has no
@@ -894,26 +971,26 @@ def run_daemon(dry_run: bool = False) -> int:
         # frozen forever with nobody left to resume it. Shutting the watchdog down must
         # never leave the box worse than not running it at all.
         if state.stopped_pid is not None:
-            print(f"[memguard] shutting down — resuming suspended pid "
+            print(f"{_stamp()} [memguard] shutting down — resuming suspended pid "
                   f"{state.stopped_pid} first", flush=True)
             _signal_pid(state.stopped_pid, signal.SIGCONT, "resumed on shutdown", dry_run)
             state.stopped_pid = None
-        print("[memguard] watchdog stopped", flush=True)
+        print(f"{_stamp()} [memguard] watchdog stopped", flush=True)
 
 
 def _signal_pid(pid: Optional[int], sig: int, verb: str, dry_run: bool = False) -> None:
     if pid is None:
         return
     if dry_run:
-        print(f"[memguard] DRY RUN: would have {verb} pid {pid}", flush=True)
+        print(f"{_stamp()} [memguard] DRY RUN: would have {verb} pid {pid}", flush=True)
         return
     try:
         os.kill(pid, sig)
-        print(f"[memguard] {verb} pid {pid}", flush=True)
+        print(f"{_stamp()} [memguard] {verb} pid {pid}", flush=True)
     except ProcessLookupError:
-        print(f"[memguard] pid {pid} already gone", flush=True)
+        print(f"{_stamp()} [memguard] pid {pid} already gone", flush=True)
     except PermissionError:
-        print(f"[memguard] not permitted to signal pid {pid}", file=sys.stderr)
+        print(f"{_stamp()} [memguard] not permitted to signal pid {pid}", file=sys.stderr)
 
 
 #: Operator actions on one window's compute children. Kill is last and separate

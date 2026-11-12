@@ -261,7 +261,8 @@ class TestWarnBeforeStop:
     """
 
     @staticmethod
-    def _drive(monkeypatch, free_gb_sequence, victim_pid=77, clock_step=200.0):
+    def _drive(monkeypatch, free_gb_sequence, victim_pid=77, clock_step=200.0,
+               events=None):
         """Drive run_daemon. `clock_step` controls the fake time.monotonic() advance
         PER CALL — large by default (200s) so the per-victim notification's 120s
         throttle never interferes with tests that are not specifically about it (a
@@ -294,11 +295,14 @@ class TestWarnBeforeStop:
         ])
         monkeypatch.setattr(memwatch, "measure_footprints", lambda procs: None)
         monkeypatch.setattr(memwatch, "resolve_ttys", lambda procs: {victim_pid: "ttys999"})
+        events = [] if events is None else events     # notify + signal, in call order
         monkeypatch.setattr(memwatch, "notify",
                             lambda title, message, tty="", dry_run=False, pid=None:
-                                notifications.append((title, message)))
+                                (notifications.append((title, message)),
+                                 events.append(("notify", title))))
         monkeypatch.setattr(memwatch, "_signal_pid",
-                            lambda pid, sig, verb, dry_run=False: signaled.append((pid, sig)))
+                            lambda pid, sig, verb, dry_run=False:
+                                (signaled.append((pid, sig)), events.append(("signal", sig))))
         monkeypatch.setattr(memwatch, "_other_daemon_pids", lambda: [])
         monkeypatch.setattr(memwatch.time, "sleep", lambda _s: None)
         monkeypatch.setattr(memwatch.time, "monotonic", fake_monotonic)
@@ -476,7 +480,9 @@ class TestWarnBeforeStop:
         proc = ProcInfo(pid=77, ppid=1, tty="ttys999", rss_gb=9.0, command="python heavy.py")
         notifications = []
         signaled = []
-        cycle = [(3.0, 24.0, 0.0)] + [(10.0, 24.0, 0.0)] * RESUME_SAMPLES
+        # A shallow bounce (6.0 <-> 3.4 GB): a 7 GB plunge in one sample would now be
+        # suspended at once as a fast fall (see TestFastFall), not throttled.
+        cycle = [(3.4, 24.0, 0.0)] + [(6.0, 24.0, 0.0)] * RESUME_SAMPLES
         samples = iter(cycle * 5)
         # Large base so the FIRST notification isn't itself throttled (mirrors a
         # real daemon's actual wall-clock start time, unlike a fake clock starting
@@ -1202,3 +1208,46 @@ class TestFolderExemptions:
             assert not self._job(job_proc.pid).is_exempt
         finally:
             _inbox.env_var_of = real
+
+
+class TestFastFall:
+    """2026-11-12 panic: a job was warned at 8.0 GB with 2.8 GB free and given a 27 s
+    grace; it reached 13.9 GB and the Mac froze 20 s after the warning. A grace period
+    is granted only if the machine can survive it."""
+
+    @staticmethod
+    def _samples(*free):
+        return [(f, 24.0, 0.0) for f in free]
+
+    def test_memory_falling_fast_is_suspended_without_a_grace_period(self, monkeypatch):
+        import signal as sig_mod
+        notifications, signaled = TestWarnBeforeStop._drive(
+            monkeypatch, self._samples(5.5, 4.6, 3.7, 2.8))
+        assert signaled and signaled[0] == (77, sig_mod.SIGSTOP)
+        assert not any("suspended soon" in t for t, _ in notifications), (
+            "falling ~0.3 GB/s toward the cliff: a grace period would outlast the Mac")
+
+    def test_a_normal_bounce_still_gets_the_grace_period(self, monkeypatch):
+        """Single-sample swings of ~2 GB are routine on a busy box (see the log)."""
+        notifications, signaled = TestWarnBeforeStop._drive(
+            monkeypatch, self._samples(5.9, 5.8, 5.9, 5.4, 5.9, 3.4))
+        assert signaled == []
+        assert any("suspended soon" in t for t, _ in notifications)
+
+    def test_the_job_is_suspended_before_anyone_is_told(self, monkeypatch):
+        """Telling (osascript, terminal lookup) costs time the machine may not have."""
+        import signal as sig_mod
+        events = []
+        TestWarnBeforeStop._drive(monkeypatch, self._samples(1.5), events=events)
+        assert events[0] == ("signal", sig_mod.SIGSTOP)
+        assert events[1][0] == "notify"
+
+
+class TestDiskAlert:
+    def test_low_disk_is_reported_once_per_hour(self, monkeypatch):
+        from memguard import memwatch
+        monkeypatch.setattr(memwatch, "DISK_WARN_GB", 1e9)
+        notifications, _ = TestWarnBeforeStop._drive(
+            monkeypatch, [(10.0, 24.0, 0.0)] * 3, clock_step=SAMPLE_SECONDS)
+        assert [t for t, _ in notifications].count(
+            "Disk almost full: memory protection weakened") == 1

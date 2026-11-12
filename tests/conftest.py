@@ -11,3 +11,4 @@ TEST_EXEMPT_PATTERNS = ("protected_service", "redis-server", "/Applications/Data
 def _pin_memwatch_config(monkeypatch):
     monkeypatch.setattr(memwatch, "EXEMPT_PATTERNS", TEST_EXEMPT_PATTERNS)
     monkeypatch.setattr(memwatch, "REPO_PATH_MARKERS", ("/Users/x/code/",))
+    monkeypatch.setattr(memwatch, "DISK_WARN_GB", 0.0)   # never this Mac's disk
