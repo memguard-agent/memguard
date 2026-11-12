@@ -112,6 +112,10 @@ FALL_HORIZON_SAMPLES = int(os.environ.get("MEMWATCH_FALL_HORIZON_SAMPLES", 6))
 DISK_WARN_GB = float(os.environ.get("MEMWATCH_DISK_WARN_GB", 20.0))
 SWAP_DIR = "/private/var/vm"
 
+#: How often the armed watchdog proves it is alive (memguard._health): ~5 us per beat,
+#: an mtime update only. Well inside _health.STALE_S (90 s).
+HEARTBEAT_EVERY_S = 15.0
+
 #: Swap room the thresholds assume. Free memory includes inactive pages that macOS
 #: frees by compressing them and swapping the result out; with no swap room they stay
 #: in RAM, so free memory overstates what is really available. When swap room (space
@@ -815,6 +819,7 @@ def run_daemon(dry_run: bool = False) -> int:
     signal.signal(signal.SIGTERM, _request_shutdown)
 
     last_warn = 0.0
+    last_beat = -HEARTBEAT_EVERY_S
     last_disk_warn = -3600.0
     #: Separate 120s cooldown for the per-victim notification, mirroring the general
     #: "warn" rate limit — a warning that keeps clearing (sustained recovery) and
@@ -836,8 +841,9 @@ def run_daemon(dry_run: bool = False) -> int:
                     EXEMPT_PATTERNS, EXEMPT_DIRS = load_exempt()
                     exempt_mtime = _exempt_file_mtime()    # after a SUCCESSFUL load
                     _announce_exempt()
-                if not dry_run:
+                if not dry_run and time.monotonic() - last_beat >= HEARTBEAT_EVERY_S:
                     _health.beat()
+                    last_beat = time.monotonic()
                 ram_free_gb, _total, swap_gb = system_memory()
                 swap_room = swap_room_gb()
                 # Every decision and message below uses the usable figure.
@@ -959,8 +965,14 @@ def run_daemon(dry_run: bool = False) -> int:
 
                 elif action == "warn" and time.monotonic() - last_warn > 120:
                     last_warn = time.monotonic()
-                    notify("Memory low", f"only {free_gb:.1f} GB free — "
-                                         f"run `uv run memguard/memwatch.py` to see who",
+                    # One scan (~70 ms), at most every 120 s: name who uses the memory.
+                    procs = scan_processes()
+                    measure_footprints(procs)
+                    largest = pick_victim(procs)
+                    notify("Memory low",
+                           f"only {free_gb:.1f} GB free"
+                           + (f"; largest job: {largest.short_command} (pid {largest.pid}, "
+                              f"{largest.best_gb:.1f} GB)" if largest else ""),
                            dry_run=dry_run)
 
                 if state.stopped_pid is not None and free_gb >= RESUME_FREE_GB:

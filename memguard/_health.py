@@ -21,8 +21,8 @@ STATE_DIR = Path(os.environ.get("MEMGUARD_STATE_DIR",
                                 os.path.expanduser("~/.cache/memguard")))
 HEARTBEAT = STATE_DIR / "heartbeat"
 
-#: The armed watchdog beats every sample (1 s). Older than this means it is not running
-#: or not sampling; generous enough that a slow sample under pressure is not "down".
+#: The armed watchdog beats every 15 s. Older than this means it is not running or not
+#: sampling; generous enough that a slow sample under pressure is not "down".
 STALE_S = 90.0
 
 
@@ -35,7 +35,7 @@ def restart_command() -> str:
 
 
 def beat() -> None:
-    """Called by the armed watchdog on every sample."""
+    """Called by the armed watchdog every memwatch.HEARTBEAT_EVERY_S (15 s)."""
     try:
         os.utime(HEARTBEAT)
     except FileNotFoundError:

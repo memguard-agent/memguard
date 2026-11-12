@@ -1296,3 +1296,14 @@ class TestSwapRoom:
         monkeypatch.setattr(memwatch, "swap_room_gb", lambda: 5.0)
         _, signaled = TestWarnBeforeStop._drive(monkeypatch, [(4.0, 24.0, 0.0)])
         assert signaled and signaled[0] == (77, sig_mod.SIGSTOP)
+
+
+class TestMemoryLowAlert:
+    def test_names_the_largest_job_and_no_developer_command(self, monkeypatch):
+        """The README promises the alert names the job using the most memory; the old
+        hint `uv run memguard/memwatch.py` failed for anyone who installed the DMG."""
+        notifications, _ = TestWarnBeforeStop._drive(monkeypatch, [(5.0, 24.0, 0.0)])
+        (title, message), = notifications
+        assert title == "Memory low"
+        assert "largest job: heavy.py (pid 77, 9.0 GB)" in message
+        assert "memwatch" not in message
