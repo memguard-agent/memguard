@@ -69,7 +69,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-from memguard import _inbox
+from memguard import _desktop, _health, _inbox
 
 GB = 1024.0 ** 3
 
@@ -583,9 +583,6 @@ def pick_victim(procs: list[ProcInfo]) -> Optional[ProcInfo]:
 # ---------------------------------------------------------------------------
 # Notification
 # ---------------------------------------------------------------------------
-_NOTIFIERS: list[subprocess.Popen] = []
-
-
 def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
            pid: Optional[int] = None) -> None:
     """Tell everyone who must know: the human and, when `pid` was started by an AI
@@ -608,18 +605,7 @@ def notify(title: str, message: str, tty: str = "", dry_run: bool = False,
         print(f"{_stamp()} [memguard] DRY RUN: would have notified {tty or 'desktop'} — "
               f"{title}: {message}", flush=True)
         return
-    # Started, never waited for: under memory pressure launching osascript can take
-    # seconds, and the watchdog must keep sampling meanwhile. Finished ones are reaped
-    # on the next call.
-    _NOTIFIERS[:] = [n for n in _NOTIFIERS if n.poll() is None]
-    try:
-        _NOTIFIERS.append(subprocess.Popen(
-            ["osascript", "-e",
-             f'display notification {message!r} with title {title!r}'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ))
-    except OSError:
-        pass
+    _desktop.notification(title, message)
     session = _inbox.session_of(pid) if pid is not None else None
     if tty and session is None:
         try:
@@ -850,6 +836,8 @@ def run_daemon(dry_run: bool = False) -> int:
                     EXEMPT_PATTERNS, EXEMPT_DIRS = load_exempt()
                     exempt_mtime = _exempt_file_mtime()    # after a SUCCESSFUL load
                     _announce_exempt()
+                if not dry_run:
+                    _health.beat()
                 ram_free_gb, _total, swap_gb = system_memory()
                 swap_room = swap_room_gb()
                 # Every decision and message below uses the usable figure.

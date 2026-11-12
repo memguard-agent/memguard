@@ -22,6 +22,7 @@ Requires macOS. Tested on macOS 26.5.
 - **When memory gets low,** you get a notification naming the job that uses the most memory.
 - **Your Claude Code agents are told too.** An agent learns that its job is using too much memory and how to reduce it, before anything gets paused. It is also told if its job is paused, resumed or stopped.
 - **If your disk is almost full,** you get a notification: macOS needs free disk space when memory runs low, and without it the Mac can freeze. While swap space is short, memguard acts earlier, as if less memory were free.
+- **If memguard itself stops running,** you're asked what to do: restart it, see why it stopped, or be reminded later. Your Claude Code agents tell you too.
 - **If memory stays critical,** the largest job is paused and continues on its own once memory frees up. Your agents themselves are never stopped, only the jobs they started.
 
 | Free memory | What memguard does |

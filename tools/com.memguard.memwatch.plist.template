@@ -4,7 +4,7 @@
   which fills in @REPO@ and @UV@ (launchd expands neither ~ nor $VARS).
 
   Keeps memguard/memwatch.py running in daemon mode permanently. It samples free memory
-  every 3 s and, under pressure, SIGSTOPs the largest non-exempt process (resuming it
+  every second and, under pressure, SIGSTOPs the largest non-exempt process (resuming it
   with SIGCONT once the box drains), escalating to SIGKILL only if suspension did not
   relieve the pressure. Exemptions: ~/.config/memguard/exempt. The `claude` CLI is
   never the victim — only its compute children.

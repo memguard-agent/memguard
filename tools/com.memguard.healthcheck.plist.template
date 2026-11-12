@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent: once a minute, checks that the memguard watchdog is alive (its
+  heartbeat) and, if not, asks the person what to do: restart it, see why it failed,
+  or be reminded later. Rendered by tools/install_memwatch.sh (@REPO@, @UV@).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memguard.healthcheck</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@UV@</string>
+        <string>run</string>
+        <string>--no-sync</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>memguard.health_check</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@REPO@</string>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>@REPO@/logs/healthcheck.log</string>
+    <key>StandardErrorPath</key>
+    <string>@REPO@/logs/healthcheck.log</string>
+</dict>
+</plist>
