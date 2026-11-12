@@ -108,6 +108,15 @@ FALL_HORIZON_SAMPLES = int(os.environ.get("MEMWATCH_FALL_HORIZON_SAMPLES", 2))
 DISK_WARN_GB = float(os.environ.get("MEMWATCH_DISK_WARN_GB", 20.0))
 SWAP_DIR = "/private/var/vm"
 
+#: Swap room the thresholds assume. Free memory includes inactive pages that macOS
+#: frees by compressing them and swapping the result out; with no swap room they stay
+#: in RAM, so free memory overstates what is really available. When swap room (space
+#: left in the swap files plus free disk) is below this, every decision counts free
+#: memory as lower by the shortfall: memguard warns, pauses and kills earlier, and
+#: resumes later. A judgment, not a measured constant: room for one more burst like
+#: the 6 GB in 20 s seen on 2026-11-12, plus margin.
+SWAP_ROOM_GB = float(os.environ.get("MEMWATCH_SWAP_ROOM_GB", 8.0))
+
 #: Guidance quoted verbatim in the pre-stop warning. memwatch only observes a pid's
 #: aggregate footprint, never what it is doing, so the advice is necessarily generic.
 STREAMING_LOADER_GUIDANCE = (
@@ -733,6 +742,17 @@ def disk_free_gb() -> float:
     return st.f_bavail * st.f_frsize / GB
 
 
+def swap_room_gb() -> float:
+    """How much more macOS can swap: space left in the swap files plus free disk."""
+    import psutil
+    return psutil.swap_memory().free / GB + disk_free_gb()
+
+
+def usable_free_gb(free_gb: float, swap_room: float) -> float:
+    """Free memory as the decisions count it: lowered by any swap-room shortfall."""
+    return free_gb - max(0.0, SWAP_ROOM_GB - swap_room)
+
+
 def kernel_pressure_level() -> int:
     """macOS's own verdict: 1 normal, 2 warning, 4 critical."""
     value = ctypes.c_int(0)
@@ -811,13 +831,17 @@ def run_daemon(dry_run: bool = False) -> int:
                     EXEMPT_PATTERNS, EXEMPT_DIRS = load_exempt()
                     exempt_mtime = _exempt_file_mtime()    # after a SUCCESSFUL load
                     _announce_exempt()
-                free_gb, _total, swap_gb = system_memory()
+                ram_free_gb, _total, swap_gb = system_memory()
+                swap_room = swap_room_gb()
+                # Every decision and message below uses the usable figure.
+                free_gb = usable_free_gb(ram_free_gb, swap_room)
                 action = decide_action(free_gb, state)
                 if free_gb < WARN_FREE_GB:          # the record a post-mortem needs
-                    print(f"{_stamp()} [memguard] sample: free {free_gb:.1f} GB, falling "
-                          f"{fall_rate_gb_s(free_gb, state):+.2f} GB/s, kernel pressure "
-                          f"{kernel_pressure_level()}, swap used {swap_gb:.1f} GB, disk "
-                          f"free {disk_free_gb():.1f} GB -> {action or 'none'}", flush=True)
+                    print(f"{_stamp()} [memguard] sample: usable {free_gb:.1f} GB "
+                          f"(RAM free {ram_free_gb:.1f}, swap room {swap_room:.1f}), "
+                          f"falling {fall_rate_gb_s(free_gb, state):+.2f} GB/s, kernel "
+                          f"pressure {kernel_pressure_level()}, swap used {swap_gb:.1f} "
+                          f"GB -> {action or 'none'}", flush=True)
                 if time.monotonic() - last_disk_warn > 3600:
                     disk_gb = disk_free_gb()
                     if disk_gb < DISK_WARN_GB:

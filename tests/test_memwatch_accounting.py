@@ -1251,3 +1251,28 @@ class TestDiskAlert:
             monkeypatch, [(10.0, 24.0, 0.0)] * 3, clock_step=SAMPLE_SECONDS)
         assert [t for t, _ in notifications].count(
             "Disk almost full: memory protection weakened") == 1
+
+
+class TestSwapRoom:
+    """Both 2026 panics reported "LOW swap space": with no room to swap, free memory
+    overstates what is really available."""
+
+    def test_plenty_of_swap_room_changes_nothing(self, monkeypatch):
+        from memguard import memwatch
+        monkeypatch.setattr(memwatch, "SWAP_ROOM_GB", 8.0)
+        assert memwatch.usable_free_gb(4.0, swap_room=50.0) == 4.0
+
+    def test_a_swap_room_shortfall_lowers_usable_memory(self, monkeypatch):
+        from memguard import memwatch
+        monkeypatch.setattr(memwatch, "SWAP_ROOM_GB", 8.0)
+        assert memwatch.usable_free_gb(4.0, swap_room=5.0) == 1.0
+
+    def test_the_daemon_acts_on_usable_memory(self, monkeypatch):
+        """4.0 GB of RAM free is no emergency, but with 5 GB of swap room left it
+        counts as 1.0 GB: the largest job is paused at once."""
+        import signal as sig_mod
+        from memguard import memwatch
+        monkeypatch.setattr(memwatch, "SWAP_ROOM_GB", 8.0)
+        monkeypatch.setattr(memwatch, "swap_room_gb", lambda: 5.0)
+        _, signaled = TestWarnBeforeStop._drive(monkeypatch, [(4.0, 24.0, 0.0)])
+        assert signaled and signaled[0] == (77, sig_mod.SIGSTOP)
