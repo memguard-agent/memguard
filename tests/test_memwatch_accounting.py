@@ -243,7 +243,7 @@ class TestWatchdogDecisions:
         assert decide_action(4.0, WatchState(stopped_pid=42)) is None
 
     def test_resumes_once_the_box_has_drained(self):
-        state = WatchState(stopped_pid=42, recovered_samples=2)
+        state = WatchState(stopped_pid=42, recovered_samples=RESUME_SAMPLES - 1)
         assert decide_action(9.0, state) == "resume"
 
     def test_does_not_resume_on_a_single_good_sample(self):
@@ -1094,6 +1094,22 @@ class TestDaemonShutdown:
         monkeypatch.setattr(memwatch, "_other_daemon_pids", lambda: [4242])
         assert memwatch.run_daemon() == 2
 
+    @pytest.mark.parametrize("command, is_daemon", [
+        ("/Users/x/.cargo/bin/uv run --no-sync memguard/memwatch.py --daemon", True),
+        ("/Users/x/memguard/.venv/bin/python memguard/memwatch.py --daemon", True),
+        ("python3.12 /Users/x/Library/Application Support/memguard/memguard/memwatch.py"
+         " --daemon --dry-run", True),
+        ("/bin/zsh -c pgrep -f \"memwatch.py --daemon\"", False),
+        ("grep memwatch.py --daemon log.txt", False),
+        ("vim memguard/memwatch.py --daemon", False),
+        ("uv run memguard/memwatch.py --watch", False),
+    ])
+    def test_only_a_running_watchdog_counts_as_one(self, command, is_daemon):
+        """2026-11-12: shell commands that merely mentioned the watchdog kept it from
+        starting for a minute."""
+        from memguard.memwatch import _is_daemon_command
+        assert _is_daemon_command(command) is is_daemon
+
     def test_dry_run_may_run_alongside_an_armed_watchdog(self, monkeypatch):
         """Dry run sends no signals, so it cannot conflict — observing is always safe."""
         from memguard import memwatch
@@ -1228,9 +1244,13 @@ class TestFastFall:
             "falling ~0.3 GB/s toward the cliff: a grace period would outlast the Mac")
 
     def test_a_normal_bounce_still_gets_the_grace_period(self, monkeypatch):
-        """Single-sample swings of ~2 GB are routine on a busy box (see the log)."""
+        """Single-sample swings of ~2 GB are routine on a busy box (see the log); the
+        fall rate is averaged over FALL_WINDOW_SAMPLES readings, so one swing after a
+        steady stretch is not a fast fall."""
+        from memguard.memwatch import FALL_WINDOW_SAMPLES
+        steady = [5.9, 5.8] * FALL_WINDOW_SAMPLES
         notifications, signaled = TestWarnBeforeStop._drive(
-            monkeypatch, self._samples(5.9, 5.8, 5.9, 5.4, 5.9, 3.4))
+            monkeypatch, self._samples(*steady[:FALL_WINDOW_SAMPLES], 3.4))
         assert signaled == []
         assert any("suspended soon" in t for t, _ in notifications)
 

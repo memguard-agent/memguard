@@ -86,20 +86,24 @@ RESUME_FREE_GB = float(os.environ.get("MEMWATCH_RESUME_FREE_GB", 6.0))
 #: job when BOX free memory falls under STOP_FREE_GB. Raising this does not make a big
 #: job safe from suspension; it changes which jobs the report calls out as anomalous.
 HEAVY_WINDOW_GB = float(os.environ.get("MEMWATCH_HEAVY_WINDOW_GB", 6.0))
-RESUME_SAMPLES = int(os.environ.get("MEMWATCH_RESUME_SAMPLES", 3))
-SAMPLE_SECONDS = float(os.environ.get("MEMWATCH_SAMPLE_SECONDS", 3.0))
+RESUME_SAMPLES = int(os.environ.get("MEMWATCH_RESUME_SAMPLES", 9))
+#: One reading (free memory, swap room, the decision) costs ~0.01 ms; the full process
+#: scan runs only when acting. Every second, because a job growing 0.3 GB/s (seen on
+#: 2026-11-12) moves ~1 GB between readings 3 s apart. The sample counts below are set
+#: for this interval: grace 27 s, resume after 9 s, fall rate over 15 s, look-ahead 6 s.
+SAMPLE_SECONDS = float(os.environ.get("MEMWATCH_SAMPLE_SECONDS", 1.0))
 
 #: Consecutive low-memory samples a warned victim gets to react before it is actually
 #: SIGSTOPped — see "WHY warn before suspend" above. Same sample-count convention as
 #: RESUME_SAMPLES (a duration in samples, not wall time, so it stays correct if
 #: SAMPLE_SECONDS is overridden).
-WARN_GRACE_SAMPLES = int(os.environ.get("MEMWATCH_WARN_GRACE_SAMPLES", 10))
+WARN_GRACE_SAMPLES = int(os.environ.get("MEMWATCH_WARN_GRACE_SAMPLES", 28))
 
 #: The fall rate of free memory is measured over this many recent samples (smoothing the
 #: +-2 GB single-sample bounces that are normal on a busy box) and projected this many
-#: samples ahead: the time the daemon needs to see the next sample and act on it.
-FALL_WINDOW_SAMPLES = int(os.environ.get("MEMWATCH_FALL_WINDOW_SAMPLES", 5))
-FALL_HORIZON_SAMPLES = int(os.environ.get("MEMWATCH_FALL_HORIZON_SAMPLES", 2))
+#: samples ahead: margin for the daemon itself being slowed down by memory pressure.
+FALL_WINDOW_SAMPLES = int(os.environ.get("MEMWATCH_FALL_WINDOW_SAMPLES", 15))
+FALL_HORIZON_SAMPLES = int(os.environ.get("MEMWATCH_FALL_HORIZON_SAMPLES", 6))
 
 #: macOS swaps to the startup disk. With too little free disk, swap cannot grow, memory
 #: that looks reclaimable is not, and the machine can freeze before free memory reads
@@ -695,6 +699,21 @@ def run_monitor(watch: bool) -> int:
         return 0
 
 
+def _is_daemon_command(command: str) -> bool:
+    """Is this command line a watchdog (`[uv run] python ... memwatch.py --daemon`)?
+
+    Matched on the arguments, not on substrings: a shell command that merely MENTIONS
+    the watchdog (`pgrep -f "memwatch.py --daemon"`, an editor, a grep) once blocked it
+    from starting for a minute on 2026-11-12.
+    """
+    tokens = command.split()
+    if not tokens or "--daemon" not in tokens:
+        return False
+    executable = os.path.basename(tokens[0])
+    return ((executable == "uv" or executable.startswith("python"))
+            and any(t.endswith("memwatch.py") for t in tokens))
+
+
 def _other_daemon_pids() -> list[int]:
     """PIDs of OTHER running `memwatch --daemon` processes.
 
@@ -720,7 +739,7 @@ def _other_daemon_pids() -> list[int]:
         except ValueError:
             continue
         parent_of[pid] = ppid
-        if "memwatch.py" in parts[2] and "--daemon" in parts[2]:
+        if _is_daemon_command(parts[2]):
             daemons.append(pid)
 
     mine = os.getpid()
@@ -836,7 +855,8 @@ def run_daemon(dry_run: bool = False) -> int:
                 # Every decision and message below uses the usable figure.
                 free_gb = usable_free_gb(ram_free_gb, swap_room)
                 action = decide_action(free_gb, state)
-                if free_gb < WARN_FREE_GB:          # the record a post-mortem needs
+                if free_gb < STOP_FREE_GB or action not in (None, "warn"):
+                    # the record a post-mortem needs (alarm zone only: 1 Hz)
                     print(f"{_stamp()} [memguard] sample: usable {free_gb:.1f} GB "
                           f"(RAM free {ram_free_gb:.1f}, swap room {swap_room:.1f}), "
                           f"falling {fall_rate_gb_s(free_gb, state):+.2f} GB/s, kernel "
