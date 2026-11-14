@@ -114,3 +114,31 @@ class TestHookDownNotice:
         assert _health.restart_command() in payload["systemMessage"]
         assert "offer to restart" in payload["hookSpecificOutput"]["additionalContext"]
         assert self._run(monkeypatch) == "", "not again within DOWN_NOTICE_EVERY_S"
+
+
+class TestRestartCommand:
+    """The offered command must work from the state launchd is actually in: after
+    `launchctl bootout`, kickstart fails ("Could not find service")."""
+
+    def _with_loaded(self, monkeypatch, loaded: set[str]):
+        monkeypatch.setattr(_health, "_loaded", lambda label: label in loaded)
+
+    def test_a_loaded_watchdog_is_kickstarted(self, monkeypatch):
+        self._with_loaded(monkeypatch, {_health.LABEL, _health.HEALTHCHECK_LABEL})
+        assert _health.restart_command() == f"launchctl kickstart -k {_health.service()}"
+
+    def test_unloaded_jobs_are_bootstrapped_from_their_plists(self, monkeypatch):
+        self._with_loaded(monkeypatch, set())
+        command = _health.restart_command()
+        assert "kickstart" not in command
+        assert f"bootstrap gui/{os.getuid()} {_health.PLIST}" in command
+        assert f"{_health.HEALTHCHECK_LABEL}.plist" in command
+
+    def test_restart_runs_the_same_commands_it_offers(self, monkeypatch):
+        self._with_loaded(monkeypatch, set())
+        ran = []
+        monkeypatch.setattr(_health.subprocess, "run",
+                            lambda argv, **k: ran.append(argv))
+        monkeypatch.setattr(_health, "is_down", lambda: True)
+        assert _health.restart(wait_s=0) is False
+        assert ran == _health.restart_argvs()

@@ -8,12 +8,14 @@ start at all, was unloaded, or hung: the Mac was silently unprotected.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
 from typing import Optional
 
 LABEL = "com.memguard.memwatch"
+HEALTHCHECK_LABEL = "com.memguard.healthcheck"
 PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 ERR_LOG = Path(__file__).resolve().parents[1] / "logs" / "memwatch.err.log"
 
@@ -26,12 +28,33 @@ HEARTBEAT = STATE_DIR / "heartbeat"
 STALE_S = 90.0
 
 
-def service() -> str:
-    return f"gui/{os.getuid()}/{LABEL}"
+def service(label: str = LABEL) -> str:
+    return f"gui/{os.getuid()}/{label}"
+
+
+def _loaded(label: str) -> bool:
+    return subprocess.run(["launchctl", "print", service(label)],
+                          capture_output=True, timeout=10).returncode == 0
+
+
+def restart_argvs() -> list[list[str]]:
+    """The commands that start the watchdog again from its current launchd state: a
+    loaded job is kickstarted; an unloaded one (`launchctl bootout`, a partial
+    uninstall) must be bootstrapped from its plist, and so must the health check if it
+    was unloaded with it. kickstart alone fails on an unloaded job."""
+    if _loaded(LABEL):
+        argvs = [["launchctl", "kickstart", "-k", service()]]
+    else:
+        argvs = [["launchctl", "bootstrap", f"gui/{os.getuid()}", str(PLIST)]]
+    if not _loaded(HEALTHCHECK_LABEL):
+        argvs.append(["launchctl", "bootstrap", f"gui/{os.getuid()}",
+                      str(PLIST.with_name(f"{HEALTHCHECK_LABEL}.plist"))])
+    return argvs
 
 
 def restart_command() -> str:
-    return f"launchctl kickstart -k {service()}"
+    """restart_argvs() as one line for a person to run."""
+    return " && ".join(shlex.join(argv) for argv in restart_argvs())
 
 
 def beat() -> None:
@@ -87,13 +110,8 @@ def diagnosis() -> str:
 
 def restart(wait_s: float = 20.0) -> bool:
     """Start the watchdog again; True once it is beating."""
-    if subprocess.run(["launchctl", "print", service()],
-                      capture_output=True, timeout=10).returncode == 0:
-        subprocess.run(["launchctl", "kickstart", "-k", service()],
-                       capture_output=True, timeout=30)
-    else:
-        subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(PLIST)],
-                       capture_output=True, timeout=30)
+    for argv in restart_argvs():
+        subprocess.run(argv, capture_output=True, timeout=30)
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
         if not is_down() and heartbeat_age_s() < 5:
