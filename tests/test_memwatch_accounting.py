@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from memguard.memwatch import (  # noqa: E402
-    RESUME_SAMPLES, SAMPLE_SECONDS, WARN_GRACE_SAMPLES, ProcInfo, WatchState, WindowUsage,
+    KILL_AFTER_PAUSE_SAMPLES, KILL_FALL_MIN_SAMPLES, RESUME_SAMPLES, SAMPLE_SECONDS, WARN_GRACE_SAMPLES, ProcInfo, WatchState, WindowUsage,
     _clean_title, build_usage, decide_action, pick_victim, resolve_ttys,
 )
 
@@ -232,8 +232,28 @@ class TestWatchdogDecisions:
         assert decide_action(3.0, WatchState(stopped_pid=42)) is None
 
     def test_escalates_to_kill_when_suspension_did_not_help(self):
-        """SIGSTOP does not free memory, so the kill escalation is genuinely required."""
-        assert decide_action(1.5, WatchState(stopped_pid=42)) == "kill"
+        """SIGSTOP does not free memory, so the kill escalation is genuinely required,
+        once the job has been suspended KILL_AFTER_PAUSE_SAMPLES."""
+        state = WatchState(stopped_pid=42, stopped_samples=KILL_AFTER_PAUSE_SAMPLES - 1)
+        assert decide_action(1.5, state) == "kill"
+
+    def test_a_just_suspended_job_is_not_killed_while_memory_is_steady(self):
+        """2026-11-13..18: 147 jobs were killed 1-3 s after being suspended, before
+        macOS had compressed or paged anything out."""
+        state = WatchState(stopped_pid=42, stopped_samples=1, recent_free=[1.6, 1.5, 1.6])
+        assert decide_action(1.5, state) is None
+
+    def test_a_just_suspended_job_is_killed_at_once_if_memory_keeps_falling(self):
+        """The suspended job cannot grow; something else is eating memory, and waiting
+        out the minimum pause is how the 2026-11-12 freeze happened."""
+        state = WatchState(stopped_pid=42, stopped_samples=3, recent_free=[1.9, 1.7, 1.5])
+        assert decide_action(1.4, state) == "kill"
+
+    def test_falling_is_measured_only_since_the_suspension(self):
+        """One reading since the suspension is no trend: the fall that caused the
+        suspension must not count as 'still falling'."""
+        state = WatchState(stopped_pid=42, stopped_samples=1, recent_free=[3.0])
+        assert decide_action(1.5, state) is None
 
     def test_swap_alone_never_escalates_to_kill(self):
         """Regression: kill used to fire on `swap used > 2 GB` alone. macOS keeps
@@ -726,7 +746,8 @@ class TestWarnBeforeStop:
         signaled = []
         samples = iter(
             [(3.0, 24.0, 0.0)] * WARN_GRACE_SAMPLES     # warn -> grace elapses -> stop
-            + [(0.5, 24.0, 9.0)]                          # still critical -> kill
+            # still critical and falling since the suspension -> kill
+            + [(0.5, 24.0, 9.0)] * KILL_FALL_MIN_SAMPLES
             + [(3.0, 24.0, 0.0)]                          # a LATER, fresh episode
         )
 

@@ -105,6 +105,18 @@ WARN_GRACE_SAMPLES = int(os.environ.get("MEMWATCH_WARN_GRACE_SAMPLES", 28))
 FALL_WINDOW_SAMPLES = int(os.environ.get("MEMWATCH_FALL_WINDOW_SAMPLES", 15))
 FALL_HORIZON_SAMPLES = int(os.environ.get("MEMWATCH_FALL_HORIZON_SAMPLES", 6))
 
+#: A suspended job still under KILL_FREE_GB is killed only once it has been suspended
+#: this many samples (10 s), or sooner if free memory is STILL FALLING since the
+#: suspension: at least KILL_FALL_MIN_SAMPLES readings since, falling at least
+#: KILL_FALLING_GB_S. Killing on the next sample (1-3 s after the suspension, before
+#: macOS had compressed or paged anything) killed 147 jobs 2026-11-13..18. The wait is
+#: safe where the 27 s warning grace of 2026-11-12 was not: that job was still RUNNING
+#: and grew 8 -> 13.9 GB; a suspended job cannot grow, and if something else keeps
+#: memory falling, the fall rule kills without waiting.
+KILL_AFTER_PAUSE_SAMPLES = int(os.environ.get("MEMWATCH_KILL_AFTER_PAUSE_SAMPLES", 10))
+KILL_FALL_MIN_SAMPLES = int(os.environ.get("MEMWATCH_KILL_FALL_MIN_SAMPLES", 3))
+KILL_FALLING_GB_S = float(os.environ.get("MEMWATCH_KILL_FALLING_GB_S", 0.1))
+
 #: macOS swaps to the startup disk. With too little free disk, swap cannot grow, memory
 #: that looks reclaimable is not, and the machine can freeze before free memory reads
 #: low (both 2026 panics reported "LOW swap space"; the disk had ~9 GB free). Below this
@@ -517,6 +529,8 @@ def memguard_disabled_pids(procs: list[ProcInfo]) -> list[int]:
 class WatchState:
     stopped_pid: Optional[int] = None
     recovered_samples: int = 0
+    #: Samples since stopped_pid was suspended (KILL_AFTER_PAUSE_SAMPLES).
+    stopped_samples: int = 0
     #: The victim already warned about an impending suspend, and how many consecutive
     #: low-memory samples have elapsed since — see decide_action's "warn_victim" case.
     warned_pid: Optional[int] = None
@@ -527,7 +541,8 @@ class WatchState:
     #: not a single tick back above STOP_FREE_GB (a zero-hysteresis reset livelocks:
     #: memory oscillating around STOP_FREE_GB re-warns forever and never stops).
     warn_recovered_samples: int = 0
-    #: The last FALL_WINDOW_SAMPLES free-memory readings, oldest first.
+    #: The last FALL_WINDOW_SAMPLES free-memory readings, oldest first. Emptied when a
+    #: job is suspended, so "still falling" counts only readings taken since.
     recent_free: list[float] = field(default_factory=list)
 
 
@@ -562,7 +577,10 @@ def decide_action(free_gb: float, state: WatchState) -> Optional[str]:
         if free_gb >= RESUME_FREE_GB and state.recovered_samples + 1 >= RESUME_SAMPLES:
             return "resume"
         if free_gb < KILL_FREE_GB:
-            return "kill"
+            still_falling = (len(state.recent_free) >= KILL_FALL_MIN_SAMPLES and
+                             fall_rate_gb_s(free_gb, state) >= KILL_FALLING_GB_S)
+            if still_falling or state.stopped_samples + 1 >= KILL_AFTER_PAUSE_SAMPLES:
+                return "kill"
         return None
     if free_gb < KILL_FREE_GB:
         return "stop_severe"
@@ -965,7 +983,8 @@ def run_daemon(dry_run: bool = False) -> int:
                             pid=victim.pid,
                         )
                         state.stopped_pid = victim.pid
-                        state.recovered_samples = 0
+                        state.recovered_samples = state.stopped_samples = 0
+                        state.recent_free = []
                     # The warning episode (if any) is over either way — a fresh
                     # cycle later should warn again (a new victim may be heaviest by
                     # then), not skip straight to stop using a stale grace-period
@@ -986,6 +1005,8 @@ def run_daemon(dry_run: bool = False) -> int:
                               f"{largest.best_gb:.1f} GB)" if largest else ""),
                            dry_run=dry_run)
 
+                if state.stopped_pid is not None:
+                    state.stopped_samples += 1
                 if state.stopped_pid is not None and free_gb >= RESUME_FREE_GB:
                     state.recovered_samples += 1
                 elif state.stopped_pid is not None:
