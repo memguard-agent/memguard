@@ -23,13 +23,13 @@ Requires macOS. Tested on macOS 26.5.
 - **Your Claude Code agents are told too.** An agent learns that its job is using too much memory and how to reduce it, before anything gets paused. It is also told if its job is paused, resumed or stopped.
 - **If your disk is almost full,** you get a notification: macOS needs free disk space when memory runs low, and without it the Mac can freeze. While swap space is short, memguard acts earlier, as if less memory were free.
 - **If memguard itself stops running,** you're asked what to do: restart it, see why it stopped, or be reminded later. Your Claude Code agents tell you too.
-- **If memory stays critical,** the largest job is paused and continues on its own once memory frees up. Your agents themselves are never stopped, only the jobs they started.
+- **If memory stays critical,** the largest job is paused and continues on its own once memory frees up. Your agents themselves are never stopped, only the jobs they started. Apps such as Terminal, Finder or your browser are never paused or stopped.
 
 | Free memory | What memguard does |
 |---|---|
 | under 6 GB | notifies you |
 | under 3.5 GB | warns the agent, then pauses its job about 30 seconds later, or at once if memory is falling fast |
-| under 2 GB | pauses the largest job immediately; if memory is still critical, stops it |
+| under 2 GB | pauses the largest job immediately; if memory is still critical 10 seconds later, or keeps falling, stops it |
 | back above 6 GB | resumes the paused job |
 
 ## Protect important programs
