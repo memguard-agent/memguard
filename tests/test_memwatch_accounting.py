@@ -1133,6 +1133,36 @@ class TestVictimSelection:
         procs = [proc(1, rss_gb=9.0, command="python protected_service.py")]
         assert pick_victim(procs) is None
 
+    TERMINAL = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+
+    def test_apps_are_never_victims_only_jobs_are(self):
+        """2026-11-13..18: with no big job running, the largest process was an app, and
+        memguard suspended Finder, Firefox, Preview and Keynote and killed Terminal four
+        times, closing every terminal window and every agent session in them."""
+        procs = [
+            proc(36079, tty="", rss_gb=1.5, command=self.TERMINAL),
+            proc(22526, tty="", rss_gb=1.8,
+                 command="/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder"),
+            proc(69051, tty="", rss_gb=2.0,
+                 command="/Applications/Firefox.app/Contents/MacOS/firefox"),
+            proc(69052, ppid=69051, tty="", rss_gb=1.2,
+                 command="/Applications/Firefox.app/Contents/MacOS/plugin-container.app"
+                         "/Contents/MacOS/plugin-container"),
+            proc(500, ppid=1, tty="ttys003", rss_gb=0.3, command="-zsh"),
+            proc(501, ppid=500, tty="", rss_gb=0.6, command="python job.py"),
+        ]
+        assert pick_victim(procs).pid == 501, "the terminal job, not an app"
+        assert pick_victim(procs[:4]) is None, "no job: nothing to suspend"
+
+    def test_a_detached_agent_job_outside_the_projects_folder_is_a_job(self, monkeypatch):
+        from memguard import _inbox
+        monkeypatch.setattr(_inbox, "session_of",
+                            lambda pid: "c9af15b2-e31c-43f5-9fff-0cc71efe017b"
+                            if pid == 7 else None)
+        procs = [proc(36079, tty="", rss_gb=1.5, command=self.TERMINAL),
+                 proc(7, tty="", rss_gb=0.9, command="python3 heavy.py")]
+        assert pick_victim(procs).pid == 7
+
 
 class TestSingleDaemonCheck:
     """Two watchdogs both pick victims and both escalate — but the check must not

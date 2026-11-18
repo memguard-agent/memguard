@@ -435,10 +435,10 @@ DETACHED_TTY = "detached"
 #: (colon-separated, default: anything under ~/code/). Scopes DETACHED_TTY: without
 #: it, every OS/GUI daemon with no controlling terminal (WindowServer, Finder, ...)
 #: would land in the "agent-owned" total and become a target of `--stop/--kill
-#: detached`. KNOWN LIMITATION: this matches the COMMAND LINE, so a detached job
-#: invoked with a bare relative path (`nohup python3 heavy.py &`) carries no marker
-#: and is excluded from the report. The daemon's victim choice (`pick_victim`) is
-#: NOT affected — it considers every targetable process on the box.
+#: detached`. It matches the COMMAND LINE, so a detached job invoked with a bare
+#: relative path (`nohup python3 heavy.py &`) carries no marker; an AGENT's such job is
+#: still in scope through its session id (detached_bucket_key). The daemon's victim
+#: choice (`pick_victim`) uses the same scope.
 REPO_PATH_MARKERS = tuple(
     m for m in os.environ.get("MEMWATCH_PROJECT_MARKERS", os.path.expanduser("~/code/")).split(":") if m
 )
@@ -458,7 +458,9 @@ def detached_bucket_key(proc: ProcInfo, resolved_tty: str) -> Optional[str]:
     """
     if resolved_tty:
         return resolved_tty
-    return DETACHED_TTY if _is_repo_process(proc.command) else None
+    if _is_repo_process(proc.command) or _inbox.session_of(proc.pid) is not None:
+        return DETACHED_TTY
+    return None
 
 
 def build_usage(procs: list[ProcInfo], titles: dict[str, str]) -> list[WindowUsage]:
@@ -579,9 +581,18 @@ def decide_action(free_gb: float, state: WatchState) -> Optional[str]:
 
 
 def pick_victim(procs: list[ProcInfo]) -> Optional[ProcInfo]:
-    """The largest process we are permitted to suspend, or None."""
-    targetable = [p for p in procs if p.is_targetable]
-    return max(targetable, key=lambda p: p.best_gb) if targetable else None
+    """The largest JOB we are permitted to suspend, or None.
+
+    A job is a process in the scope of the report and of --stop (detached_bucket_key):
+    it belongs to a terminal window, or is detached project or agent work. Apps and
+    macOS services are not jobs. Picking among every process suspended Finder,
+    Firefox and Keynote whenever no big job was running, and killed Terminal itself
+    four times (2026-11-14..18), closing every terminal window and agent session.
+    """
+    tty_of = resolve_ttys(procs)
+    jobs = [p for p in procs if p.is_targetable
+            and detached_bucket_key(p, tty_of.get(p.pid, "")) is not None]
+    return max(jobs, key=lambda p: p.best_gb) if jobs else None
 
 
 # ---------------------------------------------------------------------------
