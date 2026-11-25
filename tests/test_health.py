@@ -38,6 +38,31 @@ class TestHeartbeat:
         assert _health.is_down()
 
 
+class TestLastError:
+    @pytest.fixture
+    def err_log(self, tmp_path, monkeypatch):
+        log = tmp_path / "memwatch.err.log"
+        log.write_text("sample failed: OSError(28, 'No space left on device')\n")
+        monkeypatch.setattr(_health, "ERR_LOG", log)
+        return log
+
+    def test_an_error_written_after_the_last_beat_is_quoted(self, err_log):
+        _stop_beating()
+        assert "No space left" in _health.last_error()
+
+    def test_an_error_older_than_the_last_beat_is_not_the_reason(self, err_log):
+        """2026-11-25: the watchdog had suspended itself, and the dialog blamed a
+        "No space left on device" line that was eleven days old."""
+        old = time.time() - 11 * 86400
+        os.utime(err_log, (old, old))
+        _stop_beating()
+        assert _health.last_error() is None
+
+    def test_a_watchdog_that_never_beat_quotes_its_error(self, err_log):
+        _health.HEARTBEAT.unlink()
+        assert "No space left" in _health.last_error()
+
+
 class TestDesktop:
     @pytest.mark.parametrize("text", ["Memory low", 'say "hi"', "it's \\ odd"])
     def test_applescript_strings_are_valid(self, text):

@@ -86,6 +86,21 @@ def down_since() -> str:
         "%H:%M", time.localtime(time.time() - age))
 
 
+def last_error() -> Optional[str]:
+    """The last line of the watchdog's error log, if it was written after the last
+    beat. An older line is from an earlier failure the watchdog survived, not the
+    reason it is down now."""
+    try:
+        written = ERR_LOG.stat().st_mtime
+        lines = [l for l in ERR_LOG.read_text(errors="replace").splitlines() if l.strip()]
+    except FileNotFoundError:
+        return None
+    age = heartbeat_age_s()
+    if not lines or (age is not None and written < time.time() - age):
+        return None
+    return lines[-1].strip()[:160]
+
+
 def diagnosis() -> str:
     """Why it is down, in one line, from launchd and the watchdog's error log."""
     result = subprocess.run(["launchctl", "print", service()],
@@ -99,12 +114,9 @@ def diagnosis() -> str:
     reason = f"launchd state: {fields.get('state', '?')}"
     if fields.get("last exit code"):
         reason += f", last exit code {fields['last exit code']}"
-    try:
-        lines = [l for l in ERR_LOG.read_text(errors="replace").splitlines() if l.strip()]
-        if lines:
-            reason += f"; last error: {lines[-1].strip()[:160]}"
-    except FileNotFoundError:
-        pass
+    error = last_error()
+    if error:
+        reason += f"; last error: {error}"
     return reason
 
 
