@@ -55,6 +55,23 @@ class TestExemptions:
         """Killing the agent leaves its runaway job running — strictly worse."""
         assert not proc(1, command="claude").is_targetable
 
+    @pytest.mark.parametrize("command", [
+        "/Users/x/.cargo/bin/uv run --no-sync memguard/memwatch.py --daemon",
+        "/Users/x/code/memguard/.venv/bin/python memguard/memwatch.py --daemon",
+        "uv run memguard/memwatch.py --watch",
+    ])
+    def test_the_watchdog_is_never_its_own_victim(self, command):
+        """2026-11-25: with no big job running the watchdog was the largest job on the
+        box (it runs from ~/code/, so it is detached project work), suspended ITSELF,
+        and stayed frozen until the health check had it restarted, every two minutes.
+        Its executable is python or uv, so a match on the executable never saw it."""
+        assert not proc(1, command=command).is_targetable
+
+    def test_the_watchdog_is_not_picked_when_it_is_the_only_job(self):
+        daemon = proc(41634, rss_gb=0.02,
+                      command="/x/.venv/bin/python memguard/memwatch.py --daemon")
+        assert pick_victim([daemon]) is None
+
     def test_ordinary_compute_is_targetable(self):
         assert proc(1, command="python research/measure_variants.py").is_targetable
 
@@ -1154,6 +1171,14 @@ class TestVictimSelection:
         procs = [proc(1, rss_gb=9.0, command="python protected_service.py")]
         assert pick_victim(procs) is None
 
+    def test_a_job_too_small_to_relieve_anything_is_not_a_victim(self):
+        """2026-11-25: with no big job running the largest job was an agent's 0.14 GB
+        MCP server; suspending and then killing it frees nothing and breaks a session."""
+        procs = [proc(1, rss_gb=0.14, command="node playwright-mcp"),
+                 proc(2, rss_gb=0.05, command="-zsh")]
+        assert pick_victim(procs) is None
+        assert pick_victim(procs + [proc(3, rss_gb=0.2)]).pid == 3
+
     TERMINAL = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
 
     def test_apps_are_never_victims_only_jobs_are(self):
@@ -1331,22 +1356,38 @@ class TestSwapRoom:
     def test_plenty_of_swap_room_changes_nothing(self, monkeypatch):
         from memguard import memwatch
         monkeypatch.setattr(memwatch, "SWAP_ROOM_GB", 8.0)
-        assert memwatch.usable_free_gb(4.0, swap_room=50.0) == 4.0
+        assert memwatch.usable_free_gb(4.0, swap_room=50.0, pressure_level=2) == 4.0
 
     def test_a_swap_room_shortfall_lowers_usable_memory(self, monkeypatch):
         from memguard import memwatch
         monkeypatch.setattr(memwatch, "SWAP_ROOM_GB", 8.0)
-        assert memwatch.usable_free_gb(4.0, swap_room=5.0) == 1.0
+        assert memwatch.usable_free_gb(4.0, swap_room=5.0, pressure_level=2) == 1.0
+        assert memwatch.usable_free_gb(4.0, swap_room=5.0, pressure_level=4) == 1.0
 
-    def test_the_daemon_acts_on_usable_memory(self, monkeypatch):
-        """4.0 GB of RAM free is no emergency, but with 5 GB of swap room left it
-        counts as 1.0 GB: the largest job is paused at once."""
-        import signal as sig_mod
+    def test_a_shortfall_counts_only_once_macos_reports_pressure(self, monkeypatch):
+        """2026-11-25: with 1.2 GB of disk free, 7.2 GB of free RAM counted as 1.9 GB
+        while macOS reported normal pressure, and jobs were paused and killed. From
+        2026-11-12 to 11-25, 76% of the alarm samples were at normal pressure and 121
+        of 233 kills happened there with 6 GB or more of RAM free."""
+        from memguard import memwatch
+        monkeypatch.setattr(memwatch, "SWAP_ROOM_GB", 8.0)
+        assert memwatch.usable_free_gb(7.2, swap_room=2.7, pressure_level=1) == 7.2
+
+    def _act(self, monkeypatch, pressure_level):
         from memguard import memwatch
         monkeypatch.setattr(memwatch, "SWAP_ROOM_GB", 8.0)
         monkeypatch.setattr(memwatch, "swap_room_gb", lambda: 5.0)
-        _, signaled = TestWarnBeforeStop._drive(monkeypatch, [(4.0, 24.0, 0.0)])
-        assert signaled and signaled[0] == (77, sig_mod.SIGSTOP)
+        monkeypatch.setattr(memwatch, "kernel_pressure_level", lambda: pressure_level)
+        return TestWarnBeforeStop._drive(monkeypatch, [(7.0, 24.0, 0.0)])
+
+    def test_the_daemon_acts_on_usable_memory(self, monkeypatch):
+        """7.0 GB of RAM free is no emergency, but once macOS reports pressure with
+        5 GB of swap room left it counts as 4.0 GB: the person is warned."""
+        notifications, signaled = self._act(monkeypatch, pressure_level=2)
+        assert [t for t, _ in notifications] == ["Memory low"] and signaled == []
+
+    def test_the_daemon_leaves_a_calm_mac_alone(self, monkeypatch):
+        assert self._act(monkeypatch, pressure_level=1) == ([], [])
 
 
 class TestMemoryLowAlert:

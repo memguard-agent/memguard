@@ -131,11 +131,19 @@ HEARTBEAT_EVERY_S = 15.0
 #: Swap room the thresholds assume. Free memory includes inactive pages that macOS
 #: frees by compressing them and swapping the result out; with no swap room they stay
 #: in RAM, so free memory overstates what is really available. When swap room (space
-#: left in the swap files plus free disk) is below this, every decision counts free
-#: memory as lower by the shortfall: memguard warns, pauses and kills earlier, and
-#: resumes later. A judgment, not a measured constant: room for one more burst like
-#: the 6 GB in 20 s seen on 2026-11-12, plus margin.
+#: left in the swap files plus free disk) is below this AND macOS reports memory
+#: pressure, every decision counts free memory as lower by the shortfall: memguard
+#: warns, pauses and kills earlier, and resumes later. A judgment, not a measured
+#: constant: room for one more burst like the 6 GB in 20 s seen on 2026-11-12, plus
+#: margin.
 SWAP_ROOM_GB = float(os.environ.get("MEMWATCH_SWAP_ROOM_GB", 8.0))
+
+#: kern.memorystatus_vm_pressure_level at which macOS is reclaiming memory: 1 normal,
+#: 2 warning, 4 critical. Below it macOS is not compressing or swapping, so a swap
+#: shortfall takes nothing from free memory. Counting the shortfall at normal pressure
+#: made a full disk look like exhausted RAM: 2026-11-12..25, 76% of the alarm samples
+#: were at normal pressure, and 121 of 233 kills happened there with >= 6 GB RAM free.
+PRESSURE_WARNING = 2
 
 #: Guidance quoted verbatim in the pre-stop warning. memwatch only observes a pid's
 #: aggregate footprint, never what it is doing, so the advice is necessarily generic.
@@ -200,7 +208,27 @@ def work_dirs(pid: int) -> tuple[str, ...]:
 #: The `claude` CLI itself is never the target: killing an agent instead of its runaway
 #: job destroys the session's context while LEAVING the memory consumer running, which
 #: is strictly worse than doing nothing. Its heavy children remain fair game.
-NEVER_TARGET_PATTERNS = ("claude", "memwatch.py", "caffeinate")
+NEVER_TARGET_PATTERNS = ("claude", "caffeinate")
+
+
+def _is_memwatch_command(command: str) -> bool:
+    """Is this command line memwatch itself (`[uv run] python ... memwatch.py ...`)?
+
+    Matched on the arguments, not on substrings: a shell command that merely MENTIONS
+    the watchdog (`pgrep -f "memwatch.py --daemon"`, an editor, a grep) once blocked it
+    from starting for a minute on 2026-11-12.
+    """
+    tokens = command.split()
+    if not tokens:
+        return False
+    executable = os.path.basename(tokens[0])
+    return ((executable == "uv" or executable.startswith("python"))
+            and any(t.endswith("memwatch.py") for t in tokens))
+
+
+#: A job smaller than this is idle: the report does not name it as a window's job, and
+#: the watchdog never suspends or kills it, because that would relieve nothing.
+MIN_JOB_GB = 0.2
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +278,8 @@ class ProcInfo:
         an agent's `uv run python heavy.py` stays targetable while the `claude` process
         that launched it does not.
         """
-        if self.is_exempt:
-            return False
+        if self.is_exempt or _is_memwatch_command(self.command):
+            return False                    # a suspended watchdog protects nothing
         executable = self.command.split()[0] if self.command else ""
         return not any(p in executable for p in NEVER_TARGET_PATTERNS)
 
@@ -429,10 +457,10 @@ class WindowUsage:
     def top_child(self) -> Optional[ProcInfo]:
         """The window's heaviest compute job, or None when it is merely idle.
 
-        Ignores anything under 0.2 GB so an idle session reports "-" rather than its
-        `login` shell, which would read as a finding where there is none.
+        Ignores anything under MIN_JOB_GB so an idle session reports "-" rather than
+        its `login` shell, which would read as a finding where there is none.
         """
-        targetable = [p for p in self.procs if p.is_targetable and p.best_gb >= 0.2]
+        targetable = [p for p in self.procs if p.is_targetable and p.best_gb >= MIN_JOB_GB]
         return max(targetable, key=lambda p: p.best_gb) if targetable else None
 
 
@@ -606,9 +634,10 @@ def pick_victim(procs: list[ProcInfo]) -> Optional[ProcInfo]:
     macOS services are not jobs. Picking among every process suspended Finder,
     Firefox and Keynote whenever no big job was running, and killed Terminal itself
     four times (2026-11-14..18), closing every terminal window and agent session.
+    Nor is a job under MIN_JOB_GB: stopping it would free nothing.
     """
     tty_of = resolve_ttys(procs)
-    jobs = [p for p in procs if p.is_targetable
+    jobs = [p for p in procs if p.is_targetable and p.best_gb >= MIN_JOB_GB
             and detached_bucket_key(p, tty_of.get(p.pid, "")) is not None]
     return max(jobs, key=lambda p: p.best_gb) if jobs else None
 
@@ -719,18 +748,8 @@ def run_monitor(watch: bool) -> int:
 
 
 def _is_daemon_command(command: str) -> bool:
-    """Is this command line a watchdog (`[uv run] python ... memwatch.py --daemon`)?
-
-    Matched on the arguments, not on substrings: a shell command that merely MENTIONS
-    the watchdog (`pgrep -f "memwatch.py --daemon"`, an editor, a grep) once blocked it
-    from starting for a minute on 2026-11-12.
-    """
-    tokens = command.split()
-    if not tokens or "--daemon" not in tokens:
-        return False
-    executable = os.path.basename(tokens[0])
-    return ((executable == "uv" or executable.startswith("python"))
-            and any(t.endswith("memwatch.py") for t in tokens))
+    """Is this command line a watchdog (`[uv run] python ... memwatch.py --daemon`)?"""
+    return "--daemon" in command.split() and _is_memwatch_command(command)
 
 
 def _other_daemon_pids() -> list[int]:
@@ -786,8 +805,11 @@ def swap_room_gb() -> float:
     return psutil.swap_memory().free / GB + disk_free_gb()
 
 
-def usable_free_gb(free_gb: float, swap_room: float) -> float:
-    """Free memory as the decisions count it: lowered by any swap-room shortfall."""
+def usable_free_gb(free_gb: float, swap_room: float, pressure_level: int) -> float:
+    """Free memory as the decisions count it: lowered by any swap-room shortfall once
+    macOS reports memory pressure (PRESSURE_WARNING)."""
+    if pressure_level < PRESSURE_WARNING:
+        return free_gb
     return free_gb - max(0.0, SWAP_ROOM_GB - swap_room)
 
 
@@ -875,15 +897,16 @@ def run_daemon(dry_run: bool = False) -> int:
                     last_beat = time.monotonic()
                 ram_free_gb, _total, swap_gb = system_memory()
                 swap_room = swap_room_gb()
+                pressure = kernel_pressure_level()
                 # Every decision and message below uses the usable figure.
-                free_gb = usable_free_gb(ram_free_gb, swap_room)
+                free_gb = usable_free_gb(ram_free_gb, swap_room, pressure)
                 action = decide_action(free_gb, state)
                 if free_gb < STOP_FREE_GB or action not in (None, "warn"):
                     # the record a post-mortem needs (alarm zone only: 1 Hz)
                     print(f"{_stamp()} [memguard] sample: usable {free_gb:.1f} GB "
                           f"(RAM free {ram_free_gb:.1f}, swap room {swap_room:.1f}), "
                           f"falling {fall_rate_gb_s(free_gb, state):+.2f} GB/s, kernel "
-                          f"pressure {kernel_pressure_level()}, swap used {swap_gb:.1f} "
+                          f"pressure {pressure}, swap used {swap_gb:.1f} "
                           f"GB -> {action or 'none'}", flush=True)
                 if time.monotonic() - last_disk_warn > 3600:
                     disk_gb = disk_free_gb()
